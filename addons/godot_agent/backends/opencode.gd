@@ -16,6 +16,7 @@ const VARIANTS := ["minimal", "low", "medium", "high", "max"]
 
 var model := "opencode/deepseek-v4-flash-free"
 var variant := ""            # provider-specific reasoning effort, see VARIANTS
+var agent := "build"         # opencode agent: "build" (does the work) or "plan" (read-only)
 var auto_approve := false    # --auto: auto-approve permissions (Full Auto)
 var cli_override := ""
 var project_dir := ""
@@ -36,7 +37,7 @@ var _announced_calls := {}  # tool callID -> true
 
 
 func display_name() -> String:
-	return "OpenRouter / opencode"
+	return "OpenRouter"
 
 
 func availability() -> Dictionary:
@@ -72,6 +73,8 @@ func send(prompt: String) -> void:
 		return
 	_write_config()
 	var args := PackedStringArray(["run", "--format", "json", "-m", model])
+	if agent != "":
+		args.append_array(PackedStringArray(["--agent", agent]))
 	if variant in VARIANTS:
 		args.append_array(PackedStringArray(["--variant", variant]))
 	if auto_approve:

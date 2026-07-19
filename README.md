@@ -31,9 +31,15 @@ Pure GDScript. No native code, no Python, no Node.js, no API keys pasted anywher
 
 ## Install
 
-1. Copy the `addons/godot_agent` folder into your project's `addons/` directory.
-2. Project → Project Settings → Plugins → enable **Godot Agent**.
-3. The **Agent** dock appears on the right. Type something like:
+One command per project (new or existing) — Godot has no global-plugin mechanism, so make this part of starting any project:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/SalumuRamazani/godot-agent/main/install.sh | sh -s -- /path/to/your-project
+```
+
+(Or clone this repo once and run `./install.sh /path/to/your-project`. Manual way: copy `addons/godot_agent` into the project and enable it under Project → Project Settings → Plugins.)
+
+Open the project: the **Agent** panel appears on the lower right. Type something like:
 
 > Create a scene with a bouncing ball, then run it and fix any errors.
 
@@ -41,15 +47,17 @@ Pure GDScript. No native code, no Python, no Node.js, no API keys pasted anywher
 
 | Control | Meaning |
 |---|---|
-| Backend | **Claude Code** or **opencode** |
-| Model | Claude Code: sonnet / opus / haiku. opencode: free-form `provider/model` field + a **Models** browser |
-| Models (opencode) | Lists every model your keys unlock (`opencode models`) — click one to select it |
-| variant (opencode) | Provider reasoning effort: minimal / low / medium / high / max |
-| Keys… (opencode) | Paste API keys (`KEY=value` per line) + optional extra opencode config JSON |
-| Safe (accept edits) | The agent may edit files and use editor tools; arbitrary shell commands are still blocked |
-| Full Auto (YOLO) | Claude: `bypassPermissions` · opencode: `--auto`. The agent can run anything — keep your project in git. |
-| New | Fresh conversation (new agent session) |
-| Stop | Kill the current turn |
+| Backend | **Claude Code** (your subscription) or **OpenRouter** (any model, via the bundled opencode engine) |
+| Build / Plan | **Build** does the work. **Plan** is read-only: the agent explores the project and proposes a plan (Claude: `--permission-mode plan`, opencode: the built-in `plan` agent) |
+| Safe / Auto | **Safe**: file edits + editor tools only, shell commands blocked. **Auto**: full autonomy — keep your project in git |
+| Model button (OpenRouter) | Opens a **searchable model picker** — type `glm`, `kimi`, `free`… OpenRouter models listed first |
+| effort (OpenRouter) | Reasoning effort: minimal / low / medium / high / max |
+| Keys (OpenRouter) | Paste API keys (`KEY=value` per line) + optional extra opencode config JSON |
+| New / Stop | Fresh conversation / kill the current turn |
+
+## Is it "trained on Godot"?
+
+No model is fine-tuned here — it doesn't need to be. Every big model already knows Godot from its training, and the plugin layers three Godot-specific systems on top so it behaves like a senior Godot dev: a **Godot 4 playbook system prompt** (GDScript 2 idioms, scene composition, physics, signals, game-feel patterns, and an explicit "build the whole thing, run it, fix every error" workflow), a **live editor-context block** on every message (scene tree, selection, open script, last run output), and **engine introspection tools** (`get_class_info` returns the exact API of *your* engine build, so it never guesses signatures).
 
 ## Running GLM, Kimi, or any model (OpenRouter)
 
