@@ -30,7 +30,11 @@ static func shell_quote(s: String) -> String:
 	return "'" + s.replace("'", "'\\''") + "'"
 
 
-func start(exe: String, args: PackedStringArray, cwd: String = "", env: Dictionary = {}) -> Error:
+## force_non_tty: give the child /dev/null stdin and a pipe (not the PTY) as
+## stdout, via `exec … < /dev/null > >(cat)`. Some CLIs (Bun binaries like
+## opencode) hang or misbehave when they detect a TTY. Streaming still works —
+## the cat relay writes to our PTY. Requires /bin/bash for >(…).
+func start(exe: String, args: PackedStringArray, cwd: String = "", env: Dictionary = {}, force_non_tty: bool = false) -> Error:
 	if running:
 		return ERR_BUSY
 	var cmd := ""
@@ -41,7 +45,11 @@ func start(exe: String, args: PackedStringArray, cwd: String = "", env: Dictiona
 	cmd += "exec " + shell_quote(exe)
 	for a in args:
 		cmd += " " + shell_quote(a)
-	var info: Dictionary = OS.execute_with_pipe("/bin/sh", PackedStringArray(["-c", cmd]))
+	var shell := "/bin/sh"
+	if force_non_tty:
+		shell = "/bin/bash"
+		cmd += " < /dev/null > >(cat)"
+	var info: Dictionary = OS.execute_with_pipe(shell, PackedStringArray(["-c", cmd]))
 	if info.is_empty():
 		return FAILED
 	_stdio = info["stdio"]

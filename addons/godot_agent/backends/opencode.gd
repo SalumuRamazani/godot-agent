@@ -1,176 +1,222 @@
 @tool
 extends "agent_backend.gd"
-## EXPERIMENTAL opencode backend. Spawns `opencode serve` once (with
-## OPENCODE_CONFIG pointing at a generated config that registers the in-editor
-## MCP server), then drives it over its local REST API. Responses are not
-## token-streamed: the full assistant message arrives when the turn completes.
-## Untested against a live opencode install — treat as a starting point.
+## opencode backend: each send() spawns `opencode run --format json` in the
+## project root, streaming raw JSON events. Any provider/model opencode knows
+## works (`opencode models`), including the free `opencode/*-free` ones.
+## API keys are passed as environment variables (env_extra) or configured once
+## globally via `opencode auth login`. The in-editor MCP server is injected via
+## a generated OPENCODE_CONFIG file, so the agent gets the same editor tools as
+## the Claude Code backend.
 
 const ProcRunner := preload("../util/proc_runner.gd")
 const CliFinder := preload("../util/cli_finder.gd")
 const SystemPrompt := preload("../context/system_prompt.gd")
 
-const SERVE_TIMEOUT_MS := 20000
+const VARIANTS := ["minimal", "low", "medium", "high", "max"]
 
+var model := "opencode/deepseek-v4-flash-free"
+var variant := ""            # provider-specific reasoning effort, see VARIANTS
+var auto_approve := false    # --auto: auto-approve permissions (Full Auto)
 var cli_override := ""
 var project_dir := ""
-var opencode_config_path := ""  # absolute path of generated config (OPENCODE_CONFIG)
-var http_host: Node  # any in-tree node; used to parent HTTPRequest children
+var opencode_config_path := ""  # absolute; regenerated before every run
+var mcp_url := ""               # set by the plugin: http://127.0.0.1:<port>/mcp
+var env_extra := {}             # e.g. {"OPENROUTER_API_KEY": "sk-…"}
+var extra_config := {}          # deep-merged into the generated opencode config
+var session_id := ""
 
-var _serve_proc  # ProcRunner
-var _base_url := ""
-var _session_ttl_id := ""
-var _pending_prompt := ""
-var _serve_started_at := 0
-var _sent_system_prompt := false
+var _proc  # ProcRunner
+var _stderr_tail: Array[String] = []
+var _saw_finish := false
+var _cost := 0.0
+var _steps := 0
+var _started_ms := 0
+var _part_progress := {}    # text part id -> chars already emitted
+var _announced_calls := {}  # tool callID -> true
 
 
 func display_name() -> String:
-	return "opencode (experimental)"
+	return "OpenRouter / opencode"
 
 
 func availability() -> Dictionary:
 	var path := CliFinder.find("opencode", cli_override)
 	if path == "":
-		return {"ok": false, "detail": "opencode CLI not found — install it from opencode.ai, or set cli_override"}
+		return {"ok": false, "detail": "opencode CLI not found — curl -fsSL https://opencode.ai/install | bash, or set cli_override"}
 	return {"ok": true, "detail": path}
 
 
 func new_session() -> void:
-	_session_ttl_id = ""
-	_sent_system_prompt = false
+	session_id = ""
 
 
 func cancel() -> void:
+	if _proc != null and _proc.running:
+		_proc.kill()
 	busy = false
-	_pending_prompt = ""
-	status.emit("stopped (note: opencode may still finish server-side)")
-
-
-func shutdown() -> void:
-	if _serve_proc != null:
-		_serve_proc.shutdown()
-		_serve_proc = null
+	status.emit("stopped")
 
 
 func pump() -> void:
-	if _serve_proc != null:
-		_serve_proc.pump()
-	if _pending_prompt != "" and _base_url == "" and _serve_started_at > 0:
-		if Time.get_ticks_msec() - _serve_started_at > SERVE_TIMEOUT_MS:
-			busy = false
-			_pending_prompt = ""
-			_serve_started_at = 0
-			error.emit("opencode serve did not report a listen address within 20s")
+	if _proc != null:
+		_proc.pump()
 
 
 func send(prompt: String) -> void:
 	if busy:
 		error.emit("still working on the previous message")
 		return
-	if http_host == null or not is_instance_valid(http_host) or not http_host.is_inside_tree():
-		error.emit("opencode backend has no host node for HTTP requests")
-		return
 	var avail := availability()
 	if not avail["ok"]:
 		error.emit(String(avail["detail"]))
 		return
-	busy = true
-	if not _sent_system_prompt:
-		prompt = SystemPrompt.build() + "\n\n" + prompt
-		_sent_system_prompt = true
-	if _base_url == "":
-		_pending_prompt = prompt
-		_start_serve(String(avail["detail"]))
-	else:
-		_continue_send(prompt)
-
-
-func _start_serve(cli_path: String) -> void:
-	if _serve_proc != null and _serve_proc.running:
-		return
-	status.emit("starting opencode serve…")
-	_serve_proc = ProcRunner.new()
-	_serve_proc.line_out.connect(_scan_for_url)
-	_serve_proc.line_err.connect(_scan_for_url)
-	_serve_proc.finished.connect(func(code):
-		if _base_url == "":
-			busy = false
-			_pending_prompt = ""
-			error.emit("opencode serve exited early (code %d)" % code)
-		_base_url = "")
+	_write_config()
+	var args := PackedStringArray(["run", "--format", "json", "-m", model])
+	if variant in VARIANTS:
+		args.append_array(PackedStringArray(["--variant", variant]))
+	if auto_approve:
+		args.append("--auto")
+	if session_id != "":
+		args.append_array(PackedStringArray(["-s", session_id]))
+	args.append(prompt)
 	var env := {}
 	if opencode_config_path != "":
 		env["OPENCODE_CONFIG"] = opencode_config_path
-	_serve_started_at = Time.get_ticks_msec()
-	var err: int = _serve_proc.start(cli_path, PackedStringArray(["serve", "--port", "0"]), project_dir, env)
+	for k in env_extra:
+		env[k] = env_extra[k]
+	_stderr_tail.clear()
+	_part_progress.clear()
+	_announced_calls.clear()
+	_saw_finish = false
+	_cost = 0.0
+	_steps = 0
+	_started_ms = Time.get_ticks_msec()
+	_proc = ProcRunner.new()
+	_proc.line_out.connect(_handle_line)
+	_proc.line_err.connect(_handle_stderr)
+	_proc.finished.connect(_handle_finished)
+	var err: int = _proc.start(String(avail["detail"]), args, project_dir, env, true)
 	if err != OK:
-		busy = false
-		_pending_prompt = ""
-		error.emit("failed to start opencode serve (%d)" % err)
-
-
-func _scan_for_url(line: String) -> void:
-	if _base_url != "":
+		error.emit("failed to start opencode (%d)" % err)
+		_proc = null
 		return
-	var re := RegEx.new()
-	re.compile("https?://(?:127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0):(\\d+)")
-	var m := re.search(line)
-	if m == null:
+	busy = true
+	status.emit("thinking… (%s)" % model)
+
+
+func _write_config() -> void:
+	if opencode_config_path == "":
 		return
-	_base_url = "http://127.0.0.1:" + m.get_string(1)
-	status.emit("opencode server on " + _base_url)
-	if _pending_prompt != "":
-		var p := _pending_prompt
-		_pending_prompt = ""
-		_continue_send(p)
+	var cfg := {"$schema": "https://opencode.ai/config.json"}
+	if mcp_url != "":
+		cfg["mcp"] = {"godot_editor": {"type": "remote", "url": mcp_url, "enabled": true}}
+	# Godot specialisation at the system level: every opencode session loads
+	# the Godot instructions file, whatever model is selected.
+	var instructions_path := opencode_config_path.get_base_dir() + "/godot_agent_instructions.md"
+	var fi := FileAccess.open(instructions_path, FileAccess.WRITE)
+	if fi != null:
+		fi.store_string(SystemPrompt.build())
+		cfg["instructions"] = [instructions_path]
+	cfg = _deep_merge(cfg, extra_config)
+	var f := FileAccess.open(opencode_config_path, FileAccess.WRITE)
+	if f != null:
+		f.store_string(JSON.stringify(cfg, "  "))
 
 
-func _continue_send(prompt: String) -> void:
-	if _session_ttl_id == "":
-		_request("POST", "/session", {}, func(code: int, body: Dictionary):
-			if code >= 200 and code < 300 and body.has("id"):
-				_session_ttl_id = String(body["id"])
-				_post_message(prompt)
-			else:
-				busy = false
-				error.emit("opencode: creating a session failed (HTTP %d): %s" % [code, JSON.stringify(body).left(200)]))
+static func _deep_merge(base: Dictionary, extra: Dictionary) -> Dictionary:
+	var out := base.duplicate(true)
+	for k in extra:
+		if out.has(k) and out[k] is Dictionary and extra[k] is Dictionary:
+			out[k] = _deep_merge(out[k], extra[k])
+		else:
+			out[k] = extra[k]
+	return out
+
+
+func _handle_stderr(line: String) -> void:
+	_stderr_tail.append(line)
+	if _stderr_tail.size() > 20:
+		_stderr_tail = _stderr_tail.slice(_stderr_tail.size() - 20)
+
+
+func _handle_finished(code: int) -> void:
+	busy = false
+	if _saw_finish:
+		turn_done.emit({
+			"cost_usd": _cost,
+			"duration_ms": Time.get_ticks_msec() - _started_ms,
+			"num_turns": _steps,
+			"is_error": code != 0,
+			"subtype": "opencode",
+			"result": "",
+		})
 	else:
-		_post_message(prompt)
+		var detail := "\n".join(_stderr_tail).strip_edges()
+		if detail == "":
+			detail = "(no output — wrong model name, or missing API key? Open Keys… to add one, or pick a free opencode/* model)"
+		error.emit("opencode exited (code %d): %s" % [code, detail.left(600)])
+	_proc = null
 
 
-func _post_message(prompt: String) -> void:
-	status.emit("waiting for opencode… (no streaming in this experimental backend)")
-	_request("POST", "/session/%s/message" % _session_ttl_id,
-		{"parts": [{"type": "text", "text": prompt}]},
-		func(code: int, body: Dictionary):
-			busy = false
-			if code < 200 or code >= 300:
-				error.emit("opencode message failed (HTTP %d): %s" % [code, JSON.stringify(body).left(300)])
-				return
-			var text := ""
-			for part in body.get("parts", []):
-				if part is Dictionary and String(part.get("type", "")) == "text":
-					text += String(part.get("text", ""))
-			if text == "":
-				text = "(opencode returned no text — raw: %s)" % JSON.stringify(body).left(300)
-			message_complete.emit(text)
-			turn_done.emit({"cost_usd": 0.0, "duration_ms": 0, "num_turns": 1, "is_error": false, "subtype": "opencode"}))
+func _handle_line(line: String) -> void:
+	if line.strip_edges() == "":
+		return
+	var data = JSON.parse_string(line)
+	if not (data is Dictionary):
+		return
+	var sid := String(data.get("sessionID", ""))
+	if sid != "" and session_id == "":
+		session_id = sid
+		status.emit("session " + sid.right(8))
+	var part = data.get("part", {})
+	if not (part is Dictionary):
+		part = {}
+	match String(data.get("type", "")):
+		"text":
+			var id := String(part.get("id", ""))
+			var full := String(part.get("text", ""))
+			var prev := int(_part_progress.get(id, 0))
+			if full.length() > prev:
+				stream_delta.emit(full.substr(prev))
+				_part_progress[id] = full.length()
+		"tool", "tool_use":
+			var call_id := String(part.get("callID", part.get("id", "")))
+			var tool := String(part.get("tool", "?"))
+			var state = part.get("state", {})
+			if call_id != "" and not _announced_calls.has(call_id):
+				_announced_calls[call_id] = true
+				tool_activity.emit(tool, "")
+			if state is Dictionary and String(state.get("status", "")) == "error":
+				tool_activity.emit(tool, "error: " + String(state.get("error", "")).left(200))
+		"step_finish":
+			_saw_finish = true
+			_steps += 1
+			_cost += float(part.get("cost", 0.0))
+		"error":
+			tool_activity.emit("error", String(data.get("error", JSON.stringify(data))).left(300))
+		_:
+			pass  # tolerate unknown event types across opencode versions
 
 
-func _request(method: String, path: String, body: Dictionary, on_done: Callable) -> void:
-	var req := HTTPRequest.new()
-	req.timeout = 0
-	http_host.add_child(req)
-	req.request_completed.connect(func(result: int, code: int, _headers: PackedStringArray, resp_body: PackedByteArray):
-		req.queue_free()
-		if result != HTTPRequest.RESULT_SUCCESS:
-			on_done.call(0, {"error": "request failed (result %d)" % result})
-			return
-		var parsed = JSON.parse_string(resp_body.get_string_from_utf8())
-		on_done.call(code, parsed if parsed is Dictionary else {}))
-	var http_method := HTTPClient.METHOD_POST if method == "POST" else HTTPClient.METHOD_GET
-	var err := req.request(_base_url + path, PackedStringArray(["Content-Type: application/json"]), http_method, JSON.stringify(body))
-	if err != OK:
-		req.queue_free()
-		on_done.call(0, {"error": "could not issue request (%d)" % err})
+## Blocking helper for the dock's model picker: returns ["provider/model", …].
+## Reflects whatever API keys are configured (env_extra + `opencode auth`).
+func list_models() -> Array[String]:
+	var avail := availability()
+	if not avail["ok"]:
+		return []
+	var cmd := ""
+	for k in env_extra:
+		cmd += String(k) + "=" + ProcRunner.shell_quote(str(env_extra[k])) + " "
+	if opencode_config_path != "":
+		_write_config()
+		cmd += "OPENCODE_CONFIG=" + ProcRunner.shell_quote(opencode_config_path) + " "
+	cmd += "exec " + ProcRunner.shell_quote(String(avail["detail"])) + " models"
+	var out := []
+	var code := OS.execute("/bin/sh", PackedStringArray(["-c", cmd]), out)
+	var models: Array[String] = []
+	if code == 0 and out.size() > 0:
+		for l in String(out[0]).split("\n"):
+			var m := l.strip_edges()
+			if m != "" and m.contains("/") and not m.contains(" "):
+				models.append(m)
+	return models

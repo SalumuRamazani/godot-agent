@@ -15,13 +15,18 @@ Pure GDScript. No native code, no Python, no Node.js, no API keys pasted anywher
 ```
 
 - The plugin starts a tiny **MCP server** on `127.0.0.1:8765` (localhost only) exposing live editor tools: scene tree, add/move/delete nodes, set properties, attach scripts, exact ClassDB API lookup, run the project and capture its output.
-- Each chat message spawns your **`claude` CLI** in the project root (`--output-format stream-json`), pre-wired to that MCP server and to a Godot-specific system prompt. Claude edits `.gd` files with its own file tools and manipulates scenes/runs the game through the editor tools.
+- Each chat message spawns your chosen agent CLI in the project root, pre-wired to that MCP server and to a Godot-specific system prompt. The agent edits `.gd` files with its own file tools and manipulates scenes/runs the game through the editor tools.
+  - **Claude Code backend**: `claude -p … --output-format stream-json`, uses your Claude subscription.
+  - **opencode backend**: `opencode run --format json` — runs **any model opencode supports**: OpenRouter (GLM, Kimi, DeepSeek, Qwen, …), direct provider keys, or the built-in free `opencode/*-free` models which need **no key at all**.
 - Every message is prefixed with a live snapshot of your editor state (current scene tree, selection, open script, last run output), so the agent always has full context.
 
 ## Requirements
 
 - Godot **4.3+** (built and tested on 4.7)
-- [Claude Code](https://claude.com/claude-code) installed and logged in (`claude` CLI) — the plugin finds it in the usual install locations even when Godot is launched from Finder
+- At least one backend CLI:
+  - [Claude Code](https://claude.com/claude-code) installed and logged in (`claude` CLI), and/or
+  - [opencode](https://opencode.ai): `curl -fsSL https://opencode.ai/install | bash`
+- The plugin finds both CLIs in the usual install locations even when Godot is launched from Finder
 - macOS (Linux likely works; Windows needs CLI-discovery paths added — PRs welcome)
 
 ## Install
@@ -36,14 +41,32 @@ Pure GDScript. No native code, no Python, no Node.js, no API keys pasted anywher
 
 | Control | Meaning |
 |---|---|
-| Backend | **Claude Code** (default) or **opencode** (experimental) |
-| Model | sonnet / opus / haiku |
-| Safe (accept edits) | Claude may edit files and use editor tools; arbitrary shell commands are still blocked |
-| Full Auto (YOLO) | `bypassPermissions` — the agent can run anything. Use in projects you have under version control. |
+| Backend | **Claude Code** or **opencode** |
+| Model | Claude Code: sonnet / opus / haiku. opencode: free-form `provider/model` field + a **Models** browser |
+| Models (opencode) | Lists every model your keys unlock (`opencode models`) — click one to select it |
+| variant (opencode) | Provider reasoning effort: minimal / low / medium / high / max |
+| Keys… (opencode) | Paste API keys (`KEY=value` per line) + optional extra opencode config JSON |
+| Safe (accept edits) | The agent may edit files and use editor tools; arbitrary shell commands are still blocked |
+| Full Auto (YOLO) | Claude: `bypassPermissions` · opencode: `--auto`. The agent can run anything — keep your project in git. |
 | New | Fresh conversation (new agent session) |
 | Stop | Kill the current turn |
 
-Settings persist per project in `user://godot_agent.cfg`. If your `claude` binary lives somewhere unusual, set it there:
+## Running GLM, Kimi, or any model (OpenRouter)
+
+1. Switch the backend dropdown to **OpenRouter / opencode**. It already works with the free `opencode/*-free` models — no key needed. (opencode is the local agent engine; OpenRouter is where the models come from.)
+2. Click **Keys…** and paste your key(s), one per line:
+   ```
+   OPENROUTER_API_KEY=sk-or-…
+   ```
+   OpenRouter alone unlocks GLM, Kimi, DeepSeek, Qwen, Gemini, GPT and hundreds more. You can also use direct provider keys (`ZHIPUAI_API_KEY` for GLM, `MOONSHOT_API_KEY` for Kimi, …), or run `opencode auth login` once in a terminal instead.
+3. Click **Models** and pick one — e.g. `openrouter/z-ai/glm-4.6` or `openrouter/moonshotai/kimi-k2` (use whatever exact ids the list shows) — or type any `provider/model` straight into the field.
+4. Optional: set a **variant** (reasoning effort) and put provider parameters (temperature etc.) in the **Keys…** dialog's extra-config JSON, e.g.
+   ```json
+   {"provider": {"openrouter": {"options": {"temperature": 0.6}}}}
+   ```
+5. Chat. Same editor tools, same workflow as the Claude backend.
+
+Settings persist per project in `user://godot_agent.cfg` (macOS: `~/Library/Application Support/Godot/app_userdata/<Project Name>/`). API keys are stored there in plain text — keep that file out of any repo. If a CLI lives somewhere unusual:
 
 ```ini
 [cli]
@@ -66,8 +89,9 @@ opencode="/path/to/opencode"
 This repo is itself a minimal Godot project — open it in Godot and the dock loads. Headless tests (no tokens spent):
 
 ```sh
-godot --headless -s tests/test_mcp_server.gd      # MCP protocol over real loopback HTTP
-godot --headless -s tests/test_stream_parser.gd   # stream-json parsing via a fake claude CLI
+godot --headless -s tests/test_mcp_server.gd       # MCP protocol over real loopback HTTP
+godot --headless -s tests/test_stream_parser.gd    # stream-json parsing via a fake claude CLI
+godot --headless -s tests/test_opencode_parser.gd  # opencode event parsing via a fake opencode CLI
 ```
 
 ## Troubleshooting
@@ -80,7 +104,6 @@ godot --headless -s tests/test_stream_parser.gd   # stream-json parsing via a fa
 
 - Git checkpoint/undo per agent turn (Ziva-style)
 - Screenshot tool (editor viewport → agent)
-- Full opencode streaming backend
 - Windows/Linux CLI discovery
 
 ## License

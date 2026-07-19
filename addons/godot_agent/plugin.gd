@@ -32,12 +32,14 @@ func _enter_tree() -> void:
 	var opencode := OpencodeBackend.new()
 	opencode.project_dir = project_root
 	opencode.opencode_config_path = ProjectSettings.globalize_path("user://godot_agent_opencode.json")
+	opencode.mcp_url = "http://127.0.0.1:%d/mcp" % server.port
 	backends = {"claude_code": claude, "opencode": opencode}
 
 	dock = AgentDock.new()
 	dock.name = "Agent"
 	dock.setup(backends, ["claude_code", "opencode"], tools, server.port)
 	add_control_to_dock(EditorPlugin.DOCK_SLOT_RIGHT_UL, dock)
+	print("Godot Agent ready — 'Agent' tab in the right dock (next to Inspector), MCP on 127.0.0.1:%d" % server.port)
 
 
 func _process(_delta: float) -> void:
@@ -68,15 +70,9 @@ func _exit_tree() -> void:
 
 
 func _write_backend_configs() -> void:
+	# The opencode backend regenerates its own config before every run.
 	var url := "http://127.0.0.1:%d/mcp" % server.port
 	var claude_cfg := {"mcpServers": {"godot_editor": {"type": "http", "url": url}}}
 	var f := FileAccess.open("user://godot_agent_mcp.json", FileAccess.WRITE)
 	if f != null:
 		f.store_string(JSON.stringify(claude_cfg, "  "))
-	var oc_cfg := {
-		"$schema": "https://opencode.ai/config.json",
-		"mcp": {"godot_editor": {"type": "remote", "url": url, "enabled": true}},
-	}
-	var f2 := FileAccess.open("user://godot_agent_opencode.json", FileAccess.WRITE)
-	if f2 != null:
-		f2.store_string(JSON.stringify(oc_cfg, "  "))

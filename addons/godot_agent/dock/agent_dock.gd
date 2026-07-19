@@ -21,6 +21,14 @@ var _backend_sel: OptionButton
 var _model_sel: OptionButton
 var _mode_sel: OptionButton
 var _new_btn: Button
+var _backend_id := "claude_code"
+var _oc_model_edit: LineEdit
+var _oc_models_btn: MenuButton
+var _variant_sel: OptionButton
+var _keys_btn: Button
+var _keys_dialog: AcceptDialog
+var _keys_edit: TextEdit
+var _extra_cfg_edit: TextEdit
 var _scroll: ScrollContainer
 var _messages: VBoxContainer
 var _status: Label
@@ -84,11 +92,41 @@ func _build_ui() -> void:
 	_mode_sel.item_selected.connect(func(_i): _apply_backend_options(); _save_settings())
 	header.add_child(_mode_sel)
 
+	_oc_model_edit = LineEdit.new()
+	_oc_model_edit.custom_minimum_size = Vector2(180, 0)
+	_oc_model_edit.placeholder_text = "provider/model"
+	_oc_model_edit.tooltip_text = "opencode model as provider/model — e.g. zhipuai/glm-4.6, moonshotai/kimi-k2, opencode/deepseek-v4-flash-free. Click Models to browse."
+	_oc_model_edit.text_changed.connect(func(_t): _apply_backend_options())
+	header.add_child(_oc_model_edit)
+
+	_oc_models_btn = MenuButton.new()
+	_oc_models_btn.text = "Models"
+	_oc_models_btn.tooltip_text = "Every model opencode can reach with your current keys (add keys via Keys… to unlock more)"
+	_oc_models_btn.about_to_popup.connect(_populate_models_menu)
+	_oc_models_btn.get_popup().id_pressed.connect(_on_model_menu_pick)
+	header.add_child(_oc_models_btn)
+
+	_variant_sel = OptionButton.new()
+	_variant_sel.add_item("variant: default")
+	for v in ["minimal", "low", "medium", "high", "max"]:
+		_variant_sel.add_item(v)
+	_variant_sel.tooltip_text = "Provider-specific reasoning effort (opencode --variant)"
+	_variant_sel.item_selected.connect(func(_i): _apply_backend_options(); _save_settings())
+	header.add_child(_variant_sel)
+
+	_keys_btn = Button.new()
+	_keys_btn.text = "Keys…"
+	_keys_btn.tooltip_text = "API keys and extra opencode config"
+	_keys_btn.pressed.connect(func(): _keys_dialog.popup_centered(Vector2i(560, 500)))
+	header.add_child(_keys_btn)
+
 	_new_btn = Button.new()
 	_new_btn.text = "New"
 	_new_btn.tooltip_text = "Start a fresh conversation (clears the chat and the agent session)"
 	_new_btn.pressed.connect(_on_new_chat)
 	header.add_child(_new_btn)
+
+	_build_keys_dialog()
 
 	_scroll = ScrollContainer.new()
 	_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -127,6 +165,77 @@ func _build_ui() -> void:
 	buttons.add_child(_stop_btn)
 
 
+func _build_keys_dialog() -> void:
+	_keys_dialog = AcceptDialog.new()
+	_keys_dialog.title = "opencode — API keys & extra config"
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 6)
+	var keys_label := Label.new()
+	keys_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	keys_label.text = "API keys, one KEY=value per line.\nOPENROUTER_API_KEY unlocks GLM, Kimi, DeepSeek, Qwen and hundreds more in one key — recommended.\nAlso supported: ZHIPUAI_API_KEY (GLM direct), MOONSHOT_API_KEY (Kimi direct), OPENAI_API_KEY, DEEPSEEK_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, XAI_API_KEY…\nStored in plain text in user://godot_agent.cfg. Alternative: run `opencode auth login` once in a terminal — then nothing is needed here."
+	box.add_child(keys_label)
+	_keys_edit = TextEdit.new()
+	_keys_edit.custom_minimum_size = Vector2(0, 150)
+	_keys_edit.placeholder_text = "ZHIPUAI_API_KEY=…\nOPENROUTER_API_KEY=…"
+	box.add_child(_keys_edit)
+	var cfg_label := Label.new()
+	cfg_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	cfg_label.text = "Extra opencode config (JSON) — deep-merged into the generated config. Use it for provider options, temperature, custom providers, agents, etc. Leave empty if unsure."
+	box.add_child(cfg_label)
+	_extra_cfg_edit = TextEdit.new()
+	_extra_cfg_edit.custom_minimum_size = Vector2(0, 130)
+	_extra_cfg_edit.placeholder_text = "{\n  \"provider\": {\n    \"zhipuai\": {\"options\": {\"temperature\": 0.6}}\n  }\n}"
+	box.add_child(_extra_cfg_edit)
+	_keys_dialog.add_child(box)
+	_keys_dialog.confirmed.connect(_on_keys_saved)
+	add_child(_keys_dialog)
+
+
+func _on_keys_saved() -> void:
+	if _extra_cfg_edit.text.strip_edges() != "" and not (JSON.parse_string(_extra_cfg_edit.text) is Dictionary):
+		_add_error("Extra opencode config is not valid JSON — it will be ignored until fixed.")
+	_save_settings()
+	_apply_backend_options()
+	_refresh_status("keys saved")
+
+
+func _parse_keys(text: String) -> Dictionary:
+	var env := {}
+	for line in text.split("\n"):
+		var l := line.strip_edges()
+		if l == "" or l.begins_with("#"):
+			continue
+		var idx := l.find("=")
+		if idx > 0:
+			env[l.substr(0, idx).strip_edges()] = l.substr(idx + 1).strip_edges()
+	return env
+
+
+func _populate_models_menu() -> void:
+	var popup := _oc_models_btn.get_popup()
+	popup.clear()
+	var oc = backends.get("opencode")
+	var models: Array = oc.list_models() if oc != null else []
+	if models.is_empty():
+		popup.add_item("(no models found — is opencode installed? add keys via Keys…)")
+		popup.set_item_disabled(0, true)
+		return
+	# OpenRouter models first — that's where GLM/Kimi/etc live once a key is set.
+	var openrouter: Array = models.filter(func(m): return String(m).begins_with("openrouter/"))
+	var others: Array = models.filter(func(m): return not String(m).begins_with("openrouter/"))
+	for m in openrouter + others:
+		popup.add_item(m)
+
+
+func _on_model_menu_pick(id: int) -> void:
+	var popup := _oc_models_btn.get_popup()
+	var text := popup.get_item_text(popup.get_item_index(id))
+	if text.contains("/"):
+		_oc_model_edit.text = text
+		_apply_backend_options()
+		_save_settings()
+
+
 func _apply_settings() -> void:
 	var backend_idx := int(_cfg.get_value("ui", "backend", 0))
 	_backend_sel.selected = clampi(backend_idx, 0, backend_ids.size() - 1)
@@ -136,6 +245,13 @@ func _apply_settings() -> void:
 	for i in range(MODES.size()):
 		if MODES[i][1] == mode:
 			_mode_sel.selected = i
+	_oc_model_edit.text = String(_cfg.get_value("opencode", "model", "opencode/deepseek-v4-flash-free"))
+	var variant := String(_cfg.get_value("opencode", "variant", ""))
+	for i in range(1, _variant_sel.item_count):
+		if _variant_sel.get_item_text(i) == variant:
+			_variant_sel.selected = i
+	_keys_edit.text = String(_cfg.get_value("opencode", "keys", ""))
+	_extra_cfg_edit.text = String(_cfg.get_value("opencode", "extra_config", ""))
 	for id in backend_ids:
 		if "cli_override" in backends[id]:
 			backends[id].cli_override = String(_cfg.get_value("cli", id, ""))
@@ -145,12 +261,18 @@ func _save_settings() -> void:
 	_cfg.set_value("ui", "backend", _backend_sel.selected)
 	_cfg.set_value("ui", "model", MODELS[_model_sel.selected])
 	_cfg.set_value("ui", "mode", MODES[_mode_sel.selected][1])
+	_cfg.set_value("opencode", "model", _oc_model_edit.text.strip_edges())
+	_cfg.set_value("opencode", "variant", "" if _variant_sel.selected <= 0 else _variant_sel.get_item_text(_variant_sel.selected))
+	_cfg.set_value("opencode", "keys", _keys_edit.text)
+	_cfg.set_value("opencode", "extra_config", _extra_cfg_edit.text)
 	_cfg.save(SETTINGS_PATH)
 
 
 func _hello() -> void:
 	var avail: Dictionary = _backend.availability()
 	_add_meta("Godot Agent ready. MCP server on 127.0.0.1:%d. Try: \"Create a scene with a bouncing ball and run it.\"" % mcp_port)
+	if _backend_id == "opencode" and not _keys_edit.text.contains("OPENROUTER_API_KEY"):
+		_add_meta("Tip: free opencode/* models work right away. For GLM, Kimi & co, click Keys… and add OPENROUTER_API_KEY=…, then pick a model under Models.")
 	if not avail["ok"]:
 		_add_error(String(avail["detail"]))
 
@@ -170,21 +292,31 @@ func _select_backend(idx: int) -> void:
 	_backend.tool_activity.connect(_on_backend_tool_activity)
 	_backend.turn_done.connect(_on_backend_turn_done)
 	_backend.error.connect(_on_backend_error)
-	if "http_host" in _backend:
-		_backend.http_host = self
-	var is_claude: bool = backend_ids[idx] == "claude_code"
-	_model_sel.disabled = not is_claude
-	_mode_sel.disabled = not is_claude
+	_backend_id = backend_ids[idx]
+	var is_claude := _backend_id == "claude_code"
+	_model_sel.visible = is_claude
+	_oc_model_edit.visible = not is_claude
+	_oc_models_btn.visible = not is_claude
+	_variant_sel.visible = not is_claude
+	_keys_btn.visible = not is_claude
 	_apply_backend_options()
 	_refresh_status()
 	_save_settings()
 
 
 func _apply_backend_options() -> void:
-	if "model" in _backend:
+	if _backend_id == "claude_code":
 		_backend.model = MODELS[_model_sel.selected]
-	if "permission_mode" in _backend:
 		_backend.permission_mode = MODES[_mode_sel.selected][1]
+	else:
+		var m := _oc_model_edit.text.strip_edges()
+		if m != "":
+			_backend.model = m
+		_backend.variant = "" if _variant_sel.selected <= 0 else _variant_sel.get_item_text(_variant_sel.selected)
+		_backend.auto_approve = MODES[_mode_sel.selected][1] == "bypassPermissions"
+		_backend.env_extra = _parse_keys(_keys_edit.text)
+		var extra = JSON.parse_string(_extra_cfg_edit.text) if _extra_cfg_edit.text.strip_edges() != "" else {}
+		_backend.extra_config = extra if extra is Dictionary else {}
 
 
 func _refresh_status(extra := "") -> void:
