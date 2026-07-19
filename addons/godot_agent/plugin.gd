@@ -38,8 +38,23 @@ func _enter_tree() -> void:
 	dock = AgentDock.new()
 	dock.name = "Agent"
 	dock.setup(backends, ["claude_code", "opencode"], tools, server.port)
-	add_control_to_dock(EditorPlugin.DOCK_SLOT_RIGHT_UL, dock)
-	print("Godot Agent ready — 'Agent' tab in the right dock (next to Inspector), MCP on 127.0.0.1:%d" % server.port)
+	# Bottom-right slot: usually empty, so the dock gets its own always-visible
+	# panel under the Inspector instead of an overflowing tab strip.
+	add_control_to_dock(EditorPlugin.DOCK_SLOT_RIGHT_BL, dock)
+	call_deferred("_focus_dock")
+	print("Godot Agent ready — 'Agent' panel on the lower right, MCP on 127.0.0.1:%d" % server.port)
+
+
+func _focus_dock() -> void:
+	if dock == null:
+		return
+	var tabs := dock.get_parent() as TabContainer
+	if tabs != null:
+		var idx := tabs.get_tab_idx_from_control(dock)
+		if idx >= 0:
+			tabs.current_tab = idx
+		print("Godot Agent dock placed: container=%s tab %d/%d, visible=%s" % [
+			tabs.get_class(), idx, tabs.get_tab_count(), str(dock.is_visible_in_tree())])
 
 
 func _process(_delta: float) -> void:
