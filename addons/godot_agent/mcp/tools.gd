@@ -295,7 +295,7 @@ func _add_node(args: Dictionary) -> Dictionary:
 	var prop_report := ""
 	var props = args.get("properties", {})
 	if props is Dictionary and not props.is_empty():
-		prop_report = _apply_properties(node, props)
+		prop_report = " " + _apply_properties(node, props) + "."
 	var saved := _maybe_save(args)
 	return _ok("Added %s (%s) under %s.%s%s" % [node.name, type, _path_in_scene(root, parent), prop_report, saved])
 

@@ -12,6 +12,8 @@ signal line_out(line: String)
 signal line_err(line: String)
 signal finished(exit_code: int)
 
+const MAX_QUEUED_LINES := 10000
+
 var pid: int = -1
 var running := false
 
@@ -59,18 +61,28 @@ func start(exe: String, args: PackedStringArray, cwd: String = "", env: Dictiona
 
 
 func _read_loop(f: FileAccess, is_stdout: bool) -> void:
+	# Pipe EOF reporting is unreliable across platforms (PTY-backed pipes can
+	# return empty reads without ERR_FILE_EOF after the child dies), so treat
+	# "empty read + process gone" as EOF too, and never spin hot. Deliberate
+	# tradeoff: genuinely blank output lines are dropped.
 	while f != null and f.is_open():
 		var line := f.get_line()
-		var eof := f.get_error() == ERR_FILE_EOF
-		if line != "" or not eof:
+		var err := f.get_error()
+		if line != "":
 			_mutex.lock()
 			if is_stdout:
-				_q_out.append(line)
+				if _q_out.size() < MAX_QUEUED_LINES:
+					_q_out.append(line)
 			else:
-				_q_err.append(line)
+				if _q_err.size() < MAX_QUEUED_LINES:
+					_q_err.append(line)
 			_mutex.unlock()
-		if eof:
+		if err != OK:
 			break
+		if line == "":
+			if not OS.is_process_running(pid):
+				break
+			OS.delay_msec(10)
 	_mutex.lock()
 	_eof_count += 1
 	_mutex.unlock()
@@ -79,6 +91,9 @@ func _read_loop(f: FileAccess, is_stdout: bool) -> void:
 ## Drain queued output on the calling thread. Emits line_out/line_err per line
 ## and finished(exit_code) once both pipes hit EOF.
 func pump() -> void:
+	# Signal handlers may drop their reference to us (e.g. a backend clearing
+	# its proc on `finished`); keep self alive for the duration of the call.
+	var _self_guard: RefCounted = self
 	if _threads.is_empty():
 		return
 	_mutex.lock()
