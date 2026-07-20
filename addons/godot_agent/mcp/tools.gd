@@ -12,6 +12,14 @@ const MAX_RUN_LINES := 2000
 
 signal approval_requested(ticket: String, tool_name: String, summary: String)
 
+## Read-only set served in Ask tier; Quick tier drops the heavy playtest/vision
+## schemas. Fewer tool schemas = fewer tokens on EVERY model call.
+const ASK_TOOLS := ["approve", "get_editor_state", "get_scene_tree", "get_class_info",
+	"search_classes", "get_project_setting", "get_node_properties", "screenshot_editor"]
+const QUICK_EXCLUDE := ["play_input", "get_game_screenshot", "screenshot_editor", "play_in_editor", "stop_playing"]
+
+var profile := "economy"  # ask | quick | economy | power
+var shot_width := 960     # screenshot downscale target, tier-dependent
 var editor_enabled := true
 var run_proc  # ProcRunner while the game is running via run_project
 var run_output: Array[String] = []
@@ -54,70 +62,73 @@ func list_tools() -> Array:
 		return [_def("echo", "Echo back the given text (test tool).",
 			{"text": {"type": "string"}}, ["text"]),
 			_approve_def()]
-	return [
+	var defs := [
 		_approve_def(),
-		_def("get_editor_state", "Snapshot of the editor: edited scene, open scenes, selected nodes, current script, whether the game is playing, project root and Godot version.", {}, []),
-		_def("get_scene_tree", "Node tree of a scene as indented text: name (Type) [script]. Omit scene_path for the currently edited scene.",
-			{"scene_path": {"type": "string", "description": "res:// path of a .tscn; omit for the edited scene"}}, []),
-		_def("open_scene", "Open a scene file in the editor and make it the edited scene.",
+		_def("get_editor_state", "Editor snapshot: edited scene, selection, current script, run state, project root.", {}, []),
+		_def("get_scene_tree", "Scene node tree as indented text. Omit scene_path for the edited scene.",
+			{"scene_path": {"type": "string"}}, []),
+		_def("open_scene", "Open a .tscn in the editor.",
 			{"scene_path": {"type": "string"}}, ["scene_path"]),
-		_def("create_scene", "Create a new .tscn with a single root node, save it and open it in the editor.",
-			{"scene_path": {"type": "string", "description": "res:// path for the new .tscn"},
-			 "root_type": {"type": "string", "description": "Node class for the root, e.g. Node2D, CharacterBody2D. Default Node2D"},
-			 "root_name": {"type": "string", "description": "Root node name; defaults to file name in PascalCase"}}, ["scene_path"]),
-		_def("save_all_scenes", "Save every open scene to disk.", {}, []),
-		_def("add_node", "Add a node to the currently edited scene. parent_path is relative to the scene root ('' or '.' = root). Optionally set properties (Vector2/3/Color as arrays, resources as res:// path strings).",
+		_def("create_scene", "Create a .tscn with one root node (default Node2D), save and open it.",
+			{"scene_path": {"type": "string"}, "root_type": {"type": "string"}, "root_name": {"type": "string"}}, ["scene_path"]),
+		_def("save_all_scenes", "Save all open scenes.", {}, []),
+		_def("add_node", "Add a node to the edited scene ('' or '.' parent = root). properties: Vector2/3/Color as arrays, res:// paths load resources.",
 			{"parent_path": {"type": "string"}, "type": {"type": "string"}, "node_name": {"type": "string"},
-			 "properties": {"type": "object"},
-			 "save": {"type": "boolean", "description": "Save the scene afterwards (default true)"}},
+			 "properties": {"type": "object"}, "save": {"type": "boolean"}},
 			["type", "node_name"]),
-		_def("delete_node", "Remove a node (and its children) from the edited scene.",
+		_def("delete_node", "Delete a node (and children) from the edited scene.",
 			{"node_path": {"type": "string"}, "save": {"type": "boolean"}}, ["node_path"]),
-		_def("move_node", "Reparent a node within the edited scene, optionally at a child index.",
+		_def("move_node", "Reparent a node, optional child index.",
 			{"node_path": {"type": "string"}, "new_parent_path": {"type": "string"},
 			 "index": {"type": "integer"}, "save": {"type": "boolean"}}, ["node_path", "new_parent_path"]),
 		_def("rename_node", "Rename a node in the edited scene.",
 			{"node_path": {"type": "string"}, "new_name": {"type": "string"}, "save": {"type": "boolean"}}, ["node_path", "new_name"]),
-		_def("set_node_properties", "Set properties on a node in the edited scene. Values: numbers/strings/bools as-is, Vector2/3/Color as [x,y]/[x,y,z]/[r,g,b,a], 'Vector2(1,2)'-style strings, res:// paths load resources.",
+		_def("set_node_properties", "Set node properties (arrays become vectors/colors; res:// paths load resources).",
 			{"node_path": {"type": "string"}, "properties": {"type": "object"}, "save": {"type": "boolean"}}, ["node_path", "properties"]),
-		_def("attach_script", "Attach an existing .gd script file to a node in the edited scene. Create the file with your file tools first, then refresh_filesystem, then attach.",
-			{"node_path": {"type": "string"}, "script_path": {"type": "string", "description": "res:// path of the .gd file"}, "save": {"type": "boolean"}}, ["node_path", "script_path"]),
-		_def("get_class_info", "Exact API of a Godot class in THIS engine build: methods with signatures, properties, signals, inheritance chain. Use before calling unfamiliar APIs.",
+		_def("attach_script", "Attach an existing .gd file to a node (create the file first, then refresh_filesystem).",
+			{"node_path": {"type": "string"}, "script_path": {"type": "string"}, "save": {"type": "boolean"}}, ["node_path", "script_path"]),
+		_def("get_class_info", "Exact API of a class in THIS engine build: methods, properties, signals, inheritance.",
 			{"class": {"type": "string"}}, ["class"]),
-		_def("search_classes", "Search Godot class names (case-insensitive substring).",
+		_def("search_classes", "Search Godot class names (substring).",
 			{"query": {"type": "string"}}, ["query"]),
-		_def("run_project", "Run the project (or one scene) as a separate process, capturing stdout/stderr. Then use get_run_output; stop with stop_run.",
-			{"scene": {"type": "string", "description": "Optional res:// scene to run instead of the main scene"}}, []),
-		_def("get_run_output", "Output captured from the running (or last) run_project process.",
-			{"tail": {"type": "integer", "description": "How many trailing lines (default 100)"}}, []),
-		_def("stop_run", "Stop the process started by run_project.", {}, []),
-		_def("play_in_editor", "Play the main scene (or a given scene) inside the editor, visible to the user. Output is NOT captured — prefer run_project for debugging.",
+		_def("run_project", "Run the project (or one scene) as a process, capturing output.",
+			{"scene": {"type": "string"}}, []),
+		_def("get_run_output", "Captured output of the run (trailing lines, default 100).",
+			{"tail": {"type": "integer"}}, []),
+		_def("stop_run", "Stop the run_project process.", {}, []),
+		_def("play_in_editor", "Play in the editor, visible to the user; output NOT captured.",
 			{"scene": {"type": "string"}}, []),
 		_def("stop_playing", "Stop the scene playing in the editor.", {}, []),
-		_def("refresh_filesystem", "Rescan the project filesystem so files created/edited outside the editor appear. Call after using your file tools.", {}, []),
-		_def("instance_scene", "Instantiate a saved .tscn as a child inside the currently edited scene (proper scene composition — prefer this over duplicating nodes).",
-			{"scene_path": {"type": "string"}, "parent_path": {"type": "string", "description": "'' or '.' = scene root"},
+		_def("refresh_filesystem", "Rescan res:// after creating/editing files externally.", {}, []),
+		_def("instance_scene", "Instance a saved .tscn into the edited scene (proper composition).",
+			{"scene_path": {"type": "string"}, "parent_path": {"type": "string"},
 			 "node_name": {"type": "string"}, "properties": {"type": "object"}, "save": {"type": "boolean"}}, ["scene_path"]),
-		_def("connect_signal", "Create a persistent signal connection between two nodes in the edited scene (saved into the .tscn, like the editor's Node panel). The target method should exist in the target's script.",
+		_def("connect_signal", "Persistent signal connection saved into the .tscn; target method should exist in the target's script.",
 			{"source_path": {"type": "string"}, "signal_name": {"type": "string"},
 			 "target_path": {"type": "string"}, "method": {"type": "string"}, "save": {"type": "boolean"}},
 			["source_path", "signal_name", "target_path", "method"]),
-		_def("add_input_action", "Create/replace an input action in the project's Input Map with key and/or mouse bindings, e.g. action 'jump' with keys ['Space','W']. Saves project.godot.",
-			{"action": {"type": "string"},
-			 "keys": {"type": "array", "items": {"type": "string"}, "description": "Key names: 'Space', 'A', 'Left', 'Shift', 'Escape', …"},
-			 "mouse_button": {"type": "integer", "description": "Optional: 1=left, 2=right, 3=middle"}}, ["action"]),
-		_def("set_project_setting", "Set a project setting and save project.godot. E.g. 'application/run/main_scene' = 'res://main.tscn', 'display/window/size/viewport_width' = 1280.",
-			{"setting": {"type": "string"}, "value": {"description": "New value (string/number/bool)"}}, ["setting", "value"]),
-		_def("get_project_setting", "Read a project setting (e.g. 'application/run/main_scene').",
+		_def("add_input_action", "Create an Input Map action with key names ('Space','W',…) and/or mouse_button (1=left); saves project.godot.",
+			{"action": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}},
+			 "mouse_button": {"type": "integer"}}, ["action"]),
+		_def("set_project_setting", "Set a project setting (e.g. application/run/main_scene) and save.",
+			{"setting": {"type": "string"}, "value": {"description": "new value"}}, ["setting", "value"]),
+		_def("get_project_setting", "Read a project setting.",
 			{"setting": {"type": "string"}}, ["setting"]),
-		_def("get_node_properties", "Current non-default property values of a node in the edited scene (what the Inspector shows changed).",
+		_def("get_node_properties", "Non-default property values of a node.",
 			{"node_path": {"type": "string"}}, ["node_path"]),
-		_def("get_game_screenshot", "SEE the running game: returns the latest screenshot (refreshed every second) of the game started with run_project, plus its FPS. Wait ~2s after starting before the first call. Use it to verify visuals, layout and that things actually appear.", {}, []),
-		_def("screenshot_editor", "SEE the editor viewport (the scene as the user sees it while editing). view: '2d' or '3d' (default 3d).",
+		_def("get_game_screenshot", "Screenshot + FPS of the running game (refreshed 1/s; wait ~2s after run_project).", {}, []),
+		_def("screenshot_editor", "Screenshot of the editor viewport ('2d' or '3d').",
 			{"view": {"type": "string"}}, []),
-		_def("play_input", "PLAY the running game by simulating input. steps is an array executed in order; each step is one of: {\"action\":\"jump\",\"hold_ms\":150} tap/hold an Input Map action; {\"action\":\"move_right\",\"down\":true} press without releasing (parallel holds — release later with down:false); {\"wait_ms\":500}; {\"mouse_click\":[x,y]}; {\"mouse_move\":[x,y]}. Actions must exist in the Input Map. Returns the estimated duration — wait that long, then get_game_screenshot and get_run_output to see what happened. Playtest every gameplay feature you build.",
+		_def("play_input", "Simulate input in the running game. steps in order: {\"action\":n,\"hold_ms\":150} tap; {\"action\":n,\"down\":true|false} hold/release; {\"wait_ms\":500}; {\"mouse_click\":[x,y]}; {\"mouse_move\":[x,y]}. Then check screenshot + output.",
 			{"steps": {"type": "array", "items": {"type": "object"}}}, ["steps"]),
 	]
+	match profile:
+		"ask":
+			return defs.filter(func(d): return d["name"] in ASK_TOOLS)
+		"quick":
+			return defs.filter(func(d): return not (d["name"] in QUICK_EXCLUDE))
+		_:
+			return defs
 
 
 func _approve_def() -> Dictionary:
@@ -614,7 +625,7 @@ func _run_project(args: Dictionary) -> Dictionary:
 		run_args.append(scene)
 	for stale in ["frame_latest.png", "status.json", "input_cmd.json", "input_done.json"]:
 		DirAccess.remove_absolute(_frames_dir().path_join(stale))
-	run_args.append_array(PackedStringArray(["--", "--ga-frames=" + _frames_dir()]))
+	run_args.append_array(PackedStringArray(["--", "--ga-frames=" + _frames_dir(), "--ga-width=%d" % shot_width]))
 	var err: int = run_proc.start(OS.get_executable_path(), run_args)
 	if err != OK:
 		return _err("failed to start the game process (%d)" % err)
@@ -821,8 +832,8 @@ func _screenshot_editor(args: Dictionary) -> Dictionary:
 	var img := vp.get_texture().get_image()
 	if img == null or img.is_empty():
 		return _err("could not capture the editor viewport (headless editor has no rendering)")
-	if img.get_width() > 1152:
-		img.resize(1152, int(img.get_height() * 1152.0 / img.get_width()))
+	if img.get_width() > shot_width:
+		img.resize(shot_width, int(img.get_height() * float(shot_width) / img.get_width()))
 	DirAccess.make_dir_recursive_absolute(_frames_dir())
 	var path := _frames_dir().path_join("editor_%s.png" % view)
 	img.save_png(path)

@@ -45,6 +45,19 @@ Open the project: the **Agent** panel appears on the lower right. Type something
 
 ## Controls
 
+## Cost tiers (bottom of the dock)
+
+Every model call re-sends tool schemas, system prompt and context — the tier strip controls how much:
+
+| Tier | What it does | Cost profile |
+|---|---|---|
+| **Ask** | Read-only Q&A: 8 read tools, 3-line context, tiny prompt, cheapest model, capped turns | pennies |
+| **Quick** | Small fixes: 24 tools (no vision/playtest schemas), short prompt, minimal context, cheap model, ≤10 turns | low |
+| **Econ** | Default: full toolset, token-discipline instructions, no deep thinking, mid screenshots | balanced |
+| **Power** | Full context + vision + playtesting, strongest model (opus / reasoning-high), 16k thinking budget | expensive, best output |
+
+Each ✓ done line shows `$cost · in→out tok · steps · time` so you can see what every rollout costs. Build tiers have full machine + web access pre-approved (Bash, WebSearch, WebFetch); Ask is read-only.
+
 | Control | Meaning |
 |---|---|
 | Backend | **Claude Code** (your subscription) or **OpenRouter** (any model, via the bundled opencode engine) |

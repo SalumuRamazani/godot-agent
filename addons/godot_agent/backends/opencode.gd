@@ -17,6 +17,7 @@ const VARIANTS := ["minimal", "low", "medium", "high", "max"]
 var model := "opencode/deepseek-v4-flash-free"
 var variant := ""            # provider-specific reasoning effort, see VARIANTS
 var agent := "build"         # opencode agent: "build" (does the work) or "plan" (read-only)
+var profile := "economy"     # ask | quick | economy | power
 var auto_approve := false    # --auto: auto-approve permissions (Full Auto)
 var cli_override := ""
 var project_dir := ""
@@ -31,6 +32,8 @@ var _stderr_tail: Array[String] = []
 var _saw_finish := false
 var _cost := 0.0
 var _steps := 0
+var _tok_in := 0
+var _tok_out := 0
 var _started_ms := 0
 var _part_progress := {}    # text part id -> chars already emitted
 var _announced_calls := {}  # tool callID -> true
@@ -72,11 +75,24 @@ func send(prompt: String) -> void:
 		error.emit(String(avail["detail"]))
 		return
 	_write_config()
+	# Tier orchestration: Ask is read-only; Quick strips reasoning effort;
+	# Power raises it (unless the user picked something even higher).
+	var eff_agent := agent
+	var eff_variant := variant
+	match profile:
+		"ask":
+			eff_agent = "plan"
+			eff_variant = ""
+		"quick":
+			eff_variant = ""
+		"power":
+			if not (eff_variant in ["high", "max"]):
+				eff_variant = "high"
 	var args := PackedStringArray(["run", "--format", "json", "--thinking", "-m", model])
-	if agent != "":
-		args.append_array(PackedStringArray(["--agent", agent]))
-	if variant in VARIANTS:
-		args.append_array(PackedStringArray(["--variant", variant]))
+	if eff_agent != "":
+		args.append_array(PackedStringArray(["--agent", eff_agent]))
+	if eff_variant in VARIANTS:
+		args.append_array(PackedStringArray(["--variant", eff_variant]))
 	if auto_approve:
 		args.append("--auto")
 	if session_id != "":
@@ -93,6 +109,8 @@ func send(prompt: String) -> void:
 	_saw_finish = false
 	_cost = 0.0
 	_steps = 0
+	_tok_in = 0
+	_tok_out = 0
 	_started_ms = Time.get_ticks_msec()
 	_proc = ProcRunner.new()
 	_proc.line_out.connect(_handle_line)
@@ -118,7 +136,7 @@ func _write_config() -> void:
 	var instructions_path := opencode_config_path.get_base_dir() + "/godot_agent_instructions.md"
 	var fi := FileAccess.open(instructions_path, FileAccess.WRITE)
 	if fi != null:
-		fi.store_string(SystemPrompt.build())
+		fi.store_string(SystemPrompt.build(profile))
 		cfg["instructions"] = [instructions_path]
 	cfg = _deep_merge(cfg, extra_config)
 	var f := FileAccess.open(opencode_config_path, FileAccess.WRITE)
@@ -152,6 +170,8 @@ func _handle_finished(code: int) -> void:
 			"is_error": code != 0,
 			"subtype": "opencode",
 			"result": "",
+			"tokens_in": _tok_in,
+			"tokens_out": _tok_out,
 		})
 	else:
 		var detail := "\n".join(_stderr_tail).strip_edges()
@@ -216,6 +236,11 @@ func _handle_line(line: String) -> void:
 			_saw_finish = true
 			_steps += 1
 			_cost += float(part.get("cost", 0.0))
+			var toks = part.get("tokens", {})
+			if toks is Dictionary:
+				var cache = toks.get("cache", {})
+				_tok_in += int(toks.get("input", 0)) + (int(cache.get("read", 0)) if cache is Dictionary else 0)
+				_tok_out += int(toks.get("output", 0)) + int(toks.get("reasoning", 0))
 		"error":
 			tool_activity.emit("", "error", String(data.get("error", JSON.stringify(data))).left(300))
 		_:

@@ -9,7 +9,8 @@ const CliFinder := preload("../util/cli_finder.gd")
 const SystemPrompt := preload("../context/system_prompt.gd")
 
 var model := "sonnet"
-var permission_mode := "acceptEdits"  # or "bypassPermissions"
+var permission_mode := "acceptEdits"  # or "bypassPermissions" / "plan"
+var profile := "economy"  # ask | quick | economy | power
 var cli_override := ""
 var project_dir := ""
 var mcp_config_path := ""  # absolute path of the generated MCP config json
@@ -49,24 +50,40 @@ func send(prompt: String) -> void:
 	if session_id == "":
 		session_id = _uuid4()
 		first_turn = true
+	# Tier orchestration: model, permissions, turn caps and thinking budget.
+	var eff_model := model
+	var eff_permission := permission_mode
+	match profile:
+		"ask":
+			eff_model = "haiku"
+			eff_permission = "plan"
+		"quick":
+			eff_model = "haiku"
+		"power":
+			eff_model = "opus"
 	var args := PackedStringArray([
 		"-p", prompt,
 		"--output-format", "stream-json",
 		"--verbose",
 		"--include-partial-messages",
-		"--model", model,
-		"--permission-mode", permission_mode,
-		"--append-system-prompt", SystemPrompt.build(),
+		"--model", eff_model,
+		"--permission-mode", eff_permission,
+		"--append-system-prompt", SystemPrompt.build(profile),
 	])
+	if profile == "ask":
+		args.append_array(PackedStringArray(["--max-turns", "4"]))
+	elif profile == "quick":
+		args.append_array(PackedStringArray(["--max-turns", "10"]))
 	if mcp_config_path != "":
-		args.append_array(PackedStringArray([
-			"--mcp-config", mcp_config_path,
-			"--strict-mcp-config",
-			"--allowedTools", "mcp__godot_editor",
-		]))
-		if permission_mode == "acceptEdits":
-			# Safe mode: route permission requests (e.g. shell commands) to the
-			# in-editor Allow/Deny dialog instead of silently denying them.
+		args.append_array(PackedStringArray(["--mcp-config", mcp_config_path, "--strict-mcp-config"]))
+		if profile == "ask":
+			args.append_array(PackedStringArray(["--allowedTools", "mcp__godot_editor"]))
+		else:
+			# The user grants full machine + web access to build tiers.
+			args.append_array(PackedStringArray(["--allowedTools", "mcp__godot_editor", "Bash", "WebSearch", "WebFetch"]))
+		if eff_permission == "acceptEdits":
+			# Safe mode: route remaining permission requests to the in-editor
+			# Allow/Deny dialog instead of silently denying them.
 			args.append_array(PackedStringArray(["--permission-prompt-tool", "mcp__godot_editor__approve"]))
 	if first_turn:
 		args.append_array(PackedStringArray(["--session-id", session_id]))
@@ -80,7 +97,10 @@ func send(prompt: String) -> void:
 	_proc.line_err.connect(_handle_stderr)
 	_proc.finished.connect(_handle_finished)
 	# Generous MCP tool timeout so an approval dialog can sit unanswered a while.
-	var err: int = _proc.start(String(avail["detail"]), args, project_dir, {"MCP_TOOL_TIMEOUT": "600000"})
+	var env := {"MCP_TOOL_TIMEOUT": "600000"}
+	if profile == "power":
+		env["MAX_THINKING_TOKENS"] = "16000"
+	var err: int = _proc.start(String(avail["detail"]), args, project_dir, env)
 	if err != OK:
 		error.emit("failed to start claude (%d)" % err)
 		_proc = null
@@ -139,6 +159,9 @@ func _handle_line(line: String) -> void:
 		"result":
 			_got_result = true
 			first_turn = false
+			var usage = data.get("usage", {})
+			if not (usage is Dictionary):
+				usage = {}
 			turn_done.emit({
 				"cost_usd": float(data.get("total_cost_usd", 0.0)),
 				"duration_ms": int(data.get("duration_ms", 0)),
@@ -146,6 +169,8 @@ func _handle_line(line: String) -> void:
 				"is_error": bool(data.get("is_error", false)),
 				"subtype": String(data.get("subtype", "")),
 				"result": String(data.get("result", "")),
+				"tokens_in": int(usage.get("input_tokens", 0)) + int(usage.get("cache_read_input_tokens", 0)),
+				"tokens_out": int(usage.get("output_tokens", 0)),
 			})
 		_:
 			pass  # tolerate unknown event types across CLI versions

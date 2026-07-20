@@ -7,7 +7,33 @@ const MAX_TREE_LINES := 40
 const MAX_RUN_TAIL := 15
 
 
-static func build(tools) -> String:
+## level: "full" (default), "quick" (tree + errors only), "ask" (three lines).
+static func build(tools, level := "full") -> String:
+	if level == "ask":
+		var root0 := EditorInterface.get_edited_scene_root()
+		var script0 := EditorInterface.get_script_editor().get_current_script()
+		return "[Editor: scene %s · script %s · Godot %s]" % [
+			root0.scene_file_path if root0 != null else "(none)",
+			script0.resource_path if script0 != null else "(none)",
+			str(Engine.get_version_info().get("string", "?"))]
+	if level == "quick":
+		var lines0: Array[String] = []
+		lines0.append("=== EDITOR CONTEXT ===")
+		var root1 := EditorInterface.get_edited_scene_root()
+		if root1 != null:
+			lines0.append("Edited scene: " + (root1.scene_file_path if root1.scene_file_path != "" else "(unsaved)"))
+			var tree0: Array[String] = []
+			_walk(root1, 0, tree0)
+			lines0.append_array(tree0.slice(0, 20))
+		var script1 := EditorInterface.get_script_editor().get_current_script()
+		if script1 != null:
+			lines0.append("Open script: " + script1.resource_path)
+		if tools != null and not tools.run_output.is_empty():
+			lines0.append("Last run tail:")
+			for l in tools.run_output.slice(maxi(0, tools.run_output.size() - 8)):
+				lines0.append("  " + str(l))
+		lines0.append("=== END ===")
+		return "\n".join(lines0)
 	var lines: Array[String] = []
 	lines.append("=== GODOT EDITOR CONTEXT (auto-generated, current as of this message) ===")
 	lines.append("Project: %s  (root: %s)" % [

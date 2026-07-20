@@ -71,6 +71,15 @@ var _history_btn: MenuButton
 var _history_ids: Array[String] = []
 var _approval_queue: Array = []
 var _approval_dialog: ConfirmationDialog
+var _tier := "economy"
+var _tier_btns := {}
+const TIERS := [
+	["Ask", "ask", "Question mode — read-only tools, cheapest model, tiny context. Just answers."],
+	["Quick", "quick", "Quick fixes — slim toolset, cheap model, capped turns, minimal context."],
+	["Econ", "economy", "Default — balanced: full tools, token-disciplined prompt, no deep thinking."],
+	["Power", "power", "Go hard — strongest model, deep thinking, full context and vision. Costs the most."],
+]
+const TIER_SHOT_WIDTH := {"ask": 640, "quick": 640, "economy": 768, "power": 1152}
 var _chat := {}            # current persisted conversation (chat_store.gd)
 var _rec_by_call := {}     # call_id -> index into _chat.messages
 var _restoring := false
@@ -271,6 +280,24 @@ func _build_ui() -> void:
 	_input.add_theme_stylebox_override("normal", input_bg)
 	_input.add_theme_stylebox_override("focus", input_bg)
 	input_box.add_child(_input)
+	var tier_row := HBoxContainer.new()
+	tier_row.add_theme_constant_override("separation", 2)
+	input_box.add_child(tier_row)
+	var tier_group := ButtonGroup.new()
+	for t in TIERS:
+		var b := Button.new()
+		b.text = t[0]
+		b.toggle_mode = true
+		b.button_group = tier_group
+		b.add_theme_font_size_override("font_size", 11)
+		b.tooltip_text = t[2]
+		var tier_id: String = t[1]
+		b.toggled.connect(func(on): if on: _set_tier(tier_id))
+		tier_row.add_child(b)
+		_tier_btns[tier_id] = b
+	var tier_spacer := Control.new()
+	tier_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tier_row.add_child(tier_spacer)
 	var btn_row := HBoxContainer.new()
 	btn_row.add_theme_constant_override("separation", 6)
 	input_box.add_child(btn_row)
@@ -478,6 +505,11 @@ func _apply_settings() -> void:
 			_variant_sel.selected = i
 	_keys_edit.text = String(_cfg.get_value("opencode", "keys", ""))
 	_extra_cfg_edit.text = String(_cfg.get_value("opencode", "extra_config", ""))
+	var tier := String(_cfg.get_value("ui", "tier", "economy"))
+	if not _tier_btns.has(tier):
+		tier = "economy"
+	_tier_btns[tier].button_pressed = true
+	_set_tier(tier)
 	for id in backend_ids:
 		if "cli_override" in backends[id]:
 			backends[id].cli_override = String(_cfg.get_value("cli", id, ""))
@@ -492,12 +524,25 @@ func _save_settings() -> void:
 	_cfg.set_value("opencode", "variant", "" if _variant_sel.selected <= 0 else _variant_sel.get_item_text(_variant_sel.selected))
 	_cfg.set_value("opencode", "keys", _keys_edit.text)
 	_cfg.set_value("opencode", "extra_config", _extra_cfg_edit.text)
+	_cfg.set_value("ui", "tier", _tier)
 	_cfg.save(SETTINGS_PATH)
 
 
 func _mode_changed() -> void:
 	_auto_check.disabled = _mode_plan.button_pressed
 	_apply_backend_options()
+	_save_settings()
+	_refresh_status()
+
+
+func _set_tier(tier: String) -> void:
+	_tier = tier
+	if tools != null:
+		tools.profile = tier
+		tools.shot_width = int(TIER_SHOT_WIDTH.get(tier, 768))
+	for b in backends.values():
+		if "profile" in b:
+			b.profile = tier
 	_save_settings()
 	_refresh_status()
 
@@ -755,15 +800,27 @@ func _apply_backend_options() -> void:
 		_backend.extra_config = extra if extra is Dictionary else {}
 
 
+func _fmt_tok(n: int) -> String:
+	if n < 1000:
+		return str(n)
+	if n < 100000:
+		return "%.1fk" % (n / 1000.0)
+	return "%dk" % (n / 1000)
+
+
 func _refresh_status(extra := "") -> void:
+	if _backend == null:
+		return
 	var avail: Dictionary = _backend.availability()
 	_status_dot.add_theme_color_override("font_color",
 		Color(0.36, 0.78, 0.42) if avail["ok"] else Color(0.9, 0.4, 0.35))
 	_status_dot.tooltip_text = String(avail["detail"])
-	var mode := "Plan" if _mode_plan.button_pressed else ("Build · Auto" if _auto_check.button_pressed else "Build · Safe")
-	var text := "%s  ·  MCP :%d" % [mode, mcp_port]
+	var mode := "Plan" if _mode_plan.button_pressed else ("Build·Auto" if _auto_check.button_pressed else "Build·Safe")
+	if _tier == "ask":
+		mode = "read-only"
+	var text := "%s · %s · MCP :%d" % [_tier.capitalize(), mode, mcp_port]
 	if extra != "":
-		text += "  ·  " + extra
+		text += " · " + extra
 	_status.text = text
 	_status.tooltip_text = String(avail["detail"])
 
@@ -789,9 +846,14 @@ func _on_send() -> void:
 	_last_final_text = ""
 	_turn_checkpoint = ""
 	if checkpoints != null and checkpoints.available and not _mode_plan.button_pressed \
-			and bool(_cfg.get_value("checkpoints", "enabled", true)):
+			and _tier != "ask" and bool(_cfg.get_value("checkpoints", "enabled", true)):
 		_turn_checkpoint = checkpoints.checkpoint()
-	var prompt := EditorContextBuilder.build(tools) + "\n\nUser request:\n" + text
+	var ctx_level := "full"
+	if _tier == "ask":
+		ctx_level = "ask"
+	elif _tier == "quick":
+		ctx_level = "quick"
+	var prompt := EditorContextBuilder.build(tools, ctx_level) + "\n\nUser request:\n" + text
 	_set_busy(true)
 	_backend.send(prompt)
 	_queue_scroll()
@@ -1057,6 +1119,8 @@ func _on_backend_turn_done(meta: Dictionary) -> void:
 	var bits: Array[String] = []
 	if float(meta.get("cost_usd", 0)) > 0:
 		bits.append("$%.4f" % float(meta["cost_usd"]))
+	if int(meta.get("tokens_in", 0)) > 0 or int(meta.get("tokens_out", 0)) > 0:
+		bits.append("%s→%s tok" % [_fmt_tok(int(meta.get("tokens_in", 0))), _fmt_tok(int(meta.get("tokens_out", 0)))])
 	if int(meta.get("num_turns", 0)) > 0:
 		bits.append("%d steps" % int(meta["num_turns"]))
 	if int(meta.get("duration_ms", 0)) > 0:

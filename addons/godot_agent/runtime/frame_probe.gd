@@ -8,8 +8,7 @@ extends Node
 ##    and executes them through Input.parse_input_event, so the agent can
 ##    actually PLAY the game: act -> watch -> fix.
 
-const MAX_WIDTH := 960
-
+var _max_width := 960
 var _dir := ""
 var _seq_done := 0
 var _active_seq := 0
@@ -22,6 +21,8 @@ func _ready() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--ga-frames="):
 			_dir = arg.trim_prefix("--ga-frames=")
+		elif arg.begins_with("--ga-width="):
+			_max_width = maxi(320, int(arg.trim_prefix("--ga-width=")))
 	if _dir == "":
 		set_process(false)
 		return
@@ -142,8 +143,8 @@ func _snap() -> void:
 	var img := get_viewport().get_texture().get_image()
 	if img == null or img.is_empty():
 		return
-	if img.get_width() > MAX_WIDTH:
-		img.resize(MAX_WIDTH, int(img.get_height() * float(MAX_WIDTH) / img.get_width()))
+	if img.get_width() > _max_width:
+		img.resize(_max_width, int(img.get_height() * float(_max_width) / img.get_width()))
 	img.save_png(_dir.path_join("frame_latest.png"))
 	var f := FileAccess.open(_dir.path_join("status.json"), FileAccess.WRITE)
 	if f != null:
