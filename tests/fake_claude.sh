@@ -3,6 +3,7 @@
 # and process plumbing can be tested without spending tokens. Ignores args.
 emit() { printf '%s\n' "$1"; sleep 0.02; }
 emit '{"type":"system","subtype":"init","session_id":"fake-session-1234","model":"claude-test","tools":[]}'
+emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering the scene"}}}'
 emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
 emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}}'
 emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world."}}}'

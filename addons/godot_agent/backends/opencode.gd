@@ -72,7 +72,7 @@ func send(prompt: String) -> void:
 		error.emit(String(avail["detail"]))
 		return
 	_write_config()
-	var args := PackedStringArray(["run", "--format", "json", "-m", model])
+	var args := PackedStringArray(["run", "--format", "json", "--thinking", "-m", model])
 	if agent != "":
 		args.append_array(PackedStringArray(["--agent", agent]))
 	if variant in VARIANTS:
@@ -182,21 +182,42 @@ func _handle_line(line: String) -> void:
 			if full.length() > prev:
 				stream_delta.emit(full.substr(prev))
 				_part_progress[id] = full.length()
+		"reasoning", "thinking":
+			var id := "think_" + String(part.get("id", ""))
+			var full := String(part.get("text", ""))
+			var prev := int(_part_progress.get(id, 0))
+			if full.length() > prev:
+				thinking_delta.emit(full.substr(prev))
+				_part_progress[id] = full.length()
 		"tool", "tool_use":
 			var call_id := String(part.get("callID", part.get("id", "")))
 			var tool := String(part.get("tool", "?"))
 			var state = part.get("state", {})
+			if not (state is Dictionary):
+				state = {}
 			if call_id != "" and not _announced_calls.has(call_id):
 				_announced_calls[call_id] = true
-				tool_activity.emit(tool, "")
-			if state is Dictionary and String(state.get("status", "")) == "error":
-				tool_activity.emit(tool, "error: " + String(state.get("error", "")).left(200))
+				tool_activity.emit(call_id, tool, "")
+			var input = state.get("input", {})
+			if not (input is Dictionary):
+				input = {}
+			var detail := describe_input(input)
+			var body := ""
+			var metadata = state.get("metadata", {})
+			if metadata is Dictionary and metadata.get("diff", "") is String and str(metadata.get("diff", "")) != "":
+				body = str(metadata["diff"]).left(2400)
+			else:
+				body = body_for(input)
+			if String(state.get("status", "")) == "error":
+				var err_text := str(state.get("error", state.get("output", ""))).left(160)
+				detail = ("⚠ " + err_text) if err_text != "" else "⚠ error"
+			tool_update.emit(call_id, tool, detail, body)
 		"step_finish":
 			_saw_finish = true
 			_steps += 1
 			_cost += float(part.get("cost", 0.0))
 		"error":
-			tool_activity.emit("error", String(data.get("error", JSON.stringify(data))).left(300))
+			tool_activity.emit("", "error", String(data.get("error", JSON.stringify(data))).left(300))
 		_:
 			pass  # tolerate unknown event types across opencode versions
 

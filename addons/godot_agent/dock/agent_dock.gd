@@ -59,9 +59,11 @@ var _cur_raw := ""
 var _busy := false
 var _scroll_queued := false
 var _tool_flow: HFlowContainer
-var _last_pill_tool := ""
-var _last_pill_label: Label
-var _last_pill_count := 0
+var _pills := {}        # call_id -> pill entry dict
+var _last_pill := {}    # most recent entry, for coalescing identical calls
+var _think_header: Button
+var _think_body: RichTextLabel
+var _think_raw := ""
 
 var _re_bold: RegEx
 var _re_inline_code: RegEx
@@ -275,18 +277,31 @@ func _build_model_picker() -> void:
 	_model_dialog.title = "Choose a model"
 	_model_dialog.ok_button_text = "Use model"
 	var box := VBoxContainer.new()
-	box.custom_minimum_size = Vector2(430, 400)
-	box.add_theme_constant_override("separation", 6)
+	box.custom_minimum_size = Vector2(460, 470)
+	box.add_theme_constant_override("separation", 8)
 	_model_filter = LineEdit.new()
-	_model_filter.placeholder_text = "Search…  glm · kimi · deepseek · qwen · free"
+	_model_filter.placeholder_text = "Search models…"
 	_model_filter.clear_button_enabled = true
 	_model_filter.text_changed.connect(func(_t): _refresh_model_list())
 	box.add_child(_model_filter)
+	var chips := HFlowContainer.new()
+	chips.add_theme_constant_override("h_separation", 4)
+	for chip in [["GLM", "glm"], ["Kimi", "kimi"], ["DeepSeek", "deepseek"], ["Qwen", "qwen"], ["Claude", "claude"], ["Gemini", "gemini"], ["Free", "free"]]:
+		var b := Button.new()
+		b.text = chip[0]
+		b.flat = true
+		b.add_theme_font_size_override("font_size", 11)
+		var term: String = chip[1]
+		b.pressed.connect(func():
+			_model_filter.text = term
+			_refresh_model_list())
+		chips.add_child(b)
+	box.add_child(chips)
 	_model_list = ItemList.new()
 	_model_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_model_list.item_activated.connect(func(_i): _pick_model(); _model_dialog.hide())
 	box.add_child(_model_list)
-	var hint := _caption("opencode/*-free models need no key · add OPENROUTER_API_KEY under Keys for GLM, Kimi and hundreds more", 10)
+	var hint := _caption("Free models need no key · add OPENROUTER_API_KEY under Keys for the full catalog", 10)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	box.add_child(hint)
 	_model_dialog.add_child(box)
@@ -299,38 +314,84 @@ func _open_model_picker() -> void:
 	_all_models.assign(oc.list_models() if oc != null else [])
 	_model_filter.text = ""
 	_refresh_model_list()
-	_model_dialog.popup_centered(Vector2i(470, 480))
+	_model_dialog.popup_centered(Vector2i(500, 540))
 	_model_filter.grab_focus()
+
+
+## "openrouter/~z-ai/glm-4.7" -> {name: "glm-4.7", provider: "z-ai", source: "openrouter"}
+func _pretty_model(id: String) -> Dictionary:
+	var source := ""
+	var rest := id
+	if rest.begins_with("openrouter/"):
+		source = "openrouter"
+		rest = rest.trim_prefix("openrouter/")
+	rest = rest.trim_prefix("~")
+	var slash := rest.find("/")
+	if slash < 0:
+		return {"name": rest, "provider": source, "source": source}
+	var provider := rest.substr(0, slash).trim_prefix("~")
+	var model_name := rest.substr(slash + 1)
+	if source == "":
+		source = provider
+	return {"name": model_name, "provider": provider, "source": source}
 
 
 func _refresh_model_list() -> void:
 	_model_list.clear()
 	var q := _model_filter.text.strip_edges().to_lower()
-	var openrouter: Array[String] = []
-	var others: Array[String] = []
-	for m in _all_models:
-		if q != "" and m.to_lower().find(q) < 0:
+	var free: Array = []
+	var openrouter: Array = []
+	var other: Array = []
+	for id in _all_models:
+		var pretty := _pretty_model(id)
+		var hay := (id + " " + String(pretty["name"]) + " " + String(pretty["provider"])).to_lower()
+		if q != "" and hay.find(q) < 0:
 			continue
-		if m.begins_with("openrouter/"):
-			openrouter.append(m)
+		var row := {"id": id, "name": pretty["name"], "provider": pretty["provider"]}
+		if id.begins_with("opencode/"):
+			row["provider"] = "free" if id.ends_with("-free") else "opencode"
+			free.append(row)
+		elif id.begins_with("openrouter/"):
+			openrouter.append(row)
 		else:
-			others.append(m)
-	for m in openrouter + others:
-		_model_list.add_item(m)
+			other.append(row)
+	var by_provider := func(a, b): return [a["provider"], a["name"]] < [b["provider"], b["name"]]
+	openrouter.sort_custom(by_provider)
+	other.sort_custom(by_provider)
+	free.sort_custom(by_provider)
+	_add_model_section("FREE — NO KEY NEEDED", free)
+	_add_model_section("OPENROUTER", openrouter)
+	_add_model_section("OTHER PROVIDERS", other)
 	if _model_list.item_count == 0:
-		_model_list.add_item("(nothing matches — no key set yet? See Keys)")
+		_model_list.add_item("nothing matches — missing a key? See Keys")
 		_model_list.set_item_disabled(0, true)
-	else:
-		_model_list.select(0)
+		return
+	for i in range(_model_list.item_count):
+		if _model_list.is_item_selectable(i):
+			_model_list.select(i)
+			break
+
+
+func _add_model_section(title: String, rows: Array) -> void:
+	if rows.is_empty():
+		return
+	var h := _model_list.add_item(title)
+	_model_list.set_item_selectable(h, false)
+	_model_list.set_item_disabled(h, true)
+	_model_list.set_item_custom_fg_color(h, Color(1, 1, 1, 0.35))
+	for row in rows:
+		var idx := _model_list.add_item("%s      %s" % [row["name"], row["provider"]])
+		_model_list.set_item_metadata(idx, row["id"])
+		_model_list.set_item_tooltip(idx, row["id"])
 
 
 func _pick_model() -> void:
 	var sel := _model_list.get_selected_items()
 	if sel.is_empty():
 		return
-	var m := _model_list.get_item_text(sel[0])
-	if m.contains("/"):
-		_model_btn.text = m
+	var meta = _model_list.get_item_metadata(sel[0])
+	if meta is String and String(meta).contains("/"):
+		_model_btn.text = String(meta)
 		_apply_backend_options()
 		_save_settings()
 
@@ -463,15 +524,17 @@ func _welcome() -> void:
 
 func _select_backend(idx: int) -> void:
 	if _backend != null:
-		for sig in ["status", "stream_delta", "message_complete", "tool_activity", "turn_done", "error"]:
+		for sig in ["status", "thinking_delta", "stream_delta", "message_complete", "tool_activity", "tool_update", "turn_done", "error"]:
 			var cb: Callable = Callable(self, "_on_backend_" + sig)
 			if _backend.is_connected(sig, cb):
 				_backend.disconnect(sig, cb)
 	_backend = backends[backend_ids[idx]]
 	_backend.status.connect(_on_backend_status)
+	_backend.thinking_delta.connect(_on_backend_thinking_delta)
 	_backend.stream_delta.connect(_on_backend_stream_delta)
 	_backend.message_complete.connect(_on_backend_message_complete)
 	_backend.tool_activity.connect(_on_backend_tool_activity)
+	_backend.tool_update.connect(_on_backend_tool_update)
 	_backend.turn_done.connect(_on_backend_turn_done)
 	_backend.error.connect(_on_backend_error)
 	_backend_id = backend_ids[idx]
@@ -556,7 +619,9 @@ func _on_new_chat() -> void:
 		c.queue_free()
 	_cur_label = null
 	_cur_raw = ""
+	_collapse_thinking()
 	_reset_pills()
+	_pills.clear()
 	_welcome()
 
 
@@ -583,7 +648,55 @@ func _on_backend_status(text: String) -> void:
 	_refresh_status(text)
 
 
+func _on_backend_thinking_delta(text: String) -> void:
+	if _think_body == null or not is_instance_valid(_think_body):
+		_begin_thinking_block()
+	_think_raw += text
+	_think_body.text = _think_raw
+	_queue_scroll()
+
+
+func _begin_thinking_block() -> void:
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 2)
+	_think_header = Button.new()
+	_think_header.flat = true
+	_think_header.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	_think_header.text = "✦ Thinking ▾"
+	_think_header.add_theme_font_size_override("font_size", 10)
+	_think_header.modulate = Color(1, 1, 1, 0.5)
+	var body := RichTextLabel.new()
+	body.bbcode_enabled = false
+	body.fit_content = true
+	body.scroll_active = false
+	body.selection_enabled = true
+	body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	body.add_theme_font_size_override("normal_font_size", 11)
+	body.modulate = Color(1, 1, 1, 0.5)
+	var header := _think_header
+	_think_header.pressed.connect(func():
+		body.visible = not body.visible
+		header.text = header.text.trim_suffix("▸").trim_suffix("▾") + ("▾" if body.visible else "▸"))
+	box.add_child(_think_header)
+	box.add_child(body)
+	_messages.add_child(box)
+	_think_body = body
+	_think_raw = ""
+
+
+func _collapse_thinking() -> void:
+	if _think_body != null and is_instance_valid(_think_body) and _think_body.visible:
+		_think_body.visible = false
+		if _think_header != null and is_instance_valid(_think_header):
+			_think_header.text = "✦ Thought ▸"
+	_think_body = null
+	_think_header = null
+	_think_raw = ""
+
+
 func _on_backend_stream_delta(text: String) -> void:
+	_collapse_thinking()
 	_reset_pills()
 	if _cur_label == null:
 		_begin_assistant_bubble()
@@ -593,6 +706,7 @@ func _on_backend_stream_delta(text: String) -> void:
 
 
 func _on_backend_message_complete(full_text: String) -> void:
+	_collapse_thinking()
 	_reset_pills()
 	if _cur_label == null:
 		_begin_assistant_bubble()
@@ -602,12 +716,22 @@ func _on_backend_message_complete(full_text: String) -> void:
 	_queue_scroll()
 
 
-func _on_backend_tool_activity(tool_name: String, detail: String) -> void:
+func _short_tool(tool_name: String) -> String:
+	return tool_name.replace("mcp__godot_editor__", "").replace("godot_editor_", "")
+
+
+func _on_backend_tool_activity(call_id: String, tool_name: String, _detail: String) -> void:
 	_finalize_stream()
-	var short_name := tool_name.replace("mcp__godot_editor__", "").replace("godot_editor_", "")
-	if detail == "" and short_name == _last_pill_tool and _last_pill_label != null and is_instance_valid(_last_pill_label):
-		_last_pill_count += 1
-		_last_pill_label.text = "%s ×%d" % [short_name, _last_pill_count]
+	_collapse_thinking()
+	var short_name := _short_tool(tool_name)
+	# Coalesce a repeat of the exact same plain call (e.g. get_run_output ×3).
+	if _last_pill.get("name", "") == short_name and _last_pill.get("plain", false) \
+			and _last_pill.get("label") != null and is_instance_valid(_last_pill["label"]):
+		_last_pill["count"] += 1
+		_last_pill["label"].text = "%s ×%d" % [short_name, _last_pill["count"]]
+		if call_id != "":
+			_pills[call_id] = _last_pill
+		_queue_scroll()
 		return
 	if _tool_flow == null or not is_instance_valid(_tool_flow):
 		_tool_flow = HFlowContainer.new()
@@ -624,30 +748,98 @@ func _on_backend_tool_activity(tool_name: String, detail: String) -> void:
 	style.content_margin_bottom = 2
 	pill.add_theme_stylebox_override("panel", style)
 	var label := Label.new()
-	label.text = short_name + (("  " + detail.left(60)) if detail != "" else "")
+	label.text = short_name
 	label.add_theme_font_size_override("font_size", 10)
 	label.add_theme_font_override("font", _mono_font())
 	label.modulate = Color(1, 1, 1, 0.7)
-	if detail != "":
-		label.tooltip_text = detail
 	pill.add_child(label)
 	_tool_flow.add_child(pill)
-	_last_pill_tool = short_name if detail == "" else ""
-	_last_pill_label = label
-	_last_pill_count = 1
+	var entry := {"name": short_name, "pill": pill, "label": label, "flow": _tool_flow,
+		"count": 1, "plain": true, "body": "", "expand": null}
+	if call_id != "":
+		_pills[call_id] = entry
+	_last_pill = entry
 	_queue_scroll()
+
+
+func _on_backend_tool_update(call_id: String, tool_name: String, detail: String, body: String) -> void:
+	var entry = _pills.get(call_id)
+	if entry == null or entry.get("label") == null or not is_instance_valid(entry["label"]):
+		if tool_name == "":
+			return
+		_on_backend_tool_activity(call_id, tool_name, "")
+		entry = _pills.get(call_id)
+		if entry == null:
+			return
+	if int(entry["count"]) == 1 and detail != "":
+		entry["plain"] = false
+		var text: String = entry["name"] + "  ·  " + detail
+		if body != "":
+			text += "  ▸"
+		entry["label"].text = text
+	if detail != "":
+		entry["label"].tooltip_text = detail
+	if body != "" and entry.get("expand") == null and is_instance_valid(entry["pill"]):
+		entry["body"] = body
+		var pill: PanelContainer = entry["pill"]
+		pill.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+		pill.tooltip_text = "Click to see the change"
+		pill.gui_input.connect(func(ev: InputEvent):
+			if ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_LEFT:
+				_toggle_diff(entry))
+	_queue_scroll()
+
+
+func _toggle_diff(entry: Dictionary) -> void:
+	var expand = entry.get("expand")
+	if expand != null and is_instance_valid(expand):
+		expand.visible = not expand.visible
+		_queue_scroll()
+		return
+	var panel := PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0, 0, 0, 0.28)
+	style.set_corner_radius_all(8)
+	style.content_margin_left = 10
+	style.content_margin_right = 10
+	style.content_margin_top = 6
+	style.content_margin_bottom = 6
+	panel.add_theme_stylebox_override("panel", style)
+	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var label := _rich_label(true)
+	label.add_theme_font_size_override("normal_font_size", 11)
+	label.text = _diff_to_bbcode(String(entry["body"]))
+	panel.add_child(label)
+	var flow = entry.get("flow")
+	_messages.add_child(panel)
+	if flow != null and is_instance_valid(flow):
+		_messages.move_child(panel, flow.get_index() + 1)
+	entry["expand"] = panel
+	_queue_scroll()
+
+
+func _diff_to_bbcode(diff: String) -> String:
+	var out: Array[String] = []
+	for raw_line in diff.split("\n"):
+		var line := raw_line.replace("[", "[lb]")
+		if raw_line.begins_with("+"):
+			line = "[color=#8fce8f]" + line + "[/color]"
+		elif raw_line.begins_with("-"):
+			line = "[color=#e08585]" + line + "[/color]"
+		out.append(line)
+	return "[code]" + "\n".join(out) + "[/code]"
 
 
 func _reset_pills() -> void:
 	_tool_flow = null
-	_last_pill_tool = ""
-	_last_pill_label = null
-	_last_pill_count = 0
+	_last_pill = {}
 
 
 func _on_backend_turn_done(meta: Dictionary) -> void:
 	_finalize_stream()
+	_collapse_thinking()
 	_reset_pills()
+	_pills.clear()
 	if meta.get("is_error", false):
 		_add_error("turn ended with an error (%s): %s" % [meta.get("subtype", "?"), String(meta.get("result", "")).left(300)])
 	var bits: Array[String] = []
@@ -666,6 +858,7 @@ func _on_backend_turn_done(meta: Dictionary) -> void:
 
 func _on_backend_error(message: String) -> void:
 	_finalize_stream()
+	_collapse_thinking()
 	_reset_pills()
 	_add_error(message)
 	_set_busy(false)

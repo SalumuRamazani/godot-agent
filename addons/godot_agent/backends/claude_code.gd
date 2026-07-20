@@ -152,15 +152,19 @@ func _handle_stream_event(event) -> void:
 	match String(event.get("type", "")):
 		"content_block_delta":
 			var delta = event.get("delta", {})
-			if delta is Dictionary and String(delta.get("type", "")) == "text_delta":
-				stream_delta.emit(String(delta.get("text", "")))
+			if delta is Dictionary:
+				match String(delta.get("type", "")):
+					"text_delta":
+						stream_delta.emit(String(delta.get("text", "")))
+					"thinking_delta":
+						thinking_delta.emit(String(delta.get("thinking", delta.get("text", ""))))
 		"content_block_start":
 			var block = event.get("content_block", {})
 			if block is Dictionary and String(block.get("type", "")) == "tool_use":
 				var id := String(block.get("id", ""))
 				if id != "" and not _announced_tools.has(id):
 					_announced_tools[id] = true
-					tool_activity.emit(String(block.get("name", "?")), "")
+					tool_activity.emit(id, String(block.get("name", "?")), "")
 
 
 func _handle_assistant(message) -> void:
@@ -175,13 +179,14 @@ func _handle_assistant(message) -> void:
 				texts.append(String(block.get("text", "")))
 			"tool_use":
 				var id := String(block.get("id", ""))
-				var input_summary := JSON.stringify(block.get("input", {}))
-				if input_summary.length() > 160:
-					input_summary = input_summary.left(160) + "…"
-				if _announced_tools.has(id):
-					continue  # already shown from the stream_event
-				_announced_tools[id] = true
-				tool_activity.emit(String(block.get("name", "?")), input_summary)
+				var tool := String(block.get("name", "?"))
+				var input = block.get("input", {})
+				if not (input is Dictionary):
+					input = {}
+				if not _announced_tools.has(id):
+					_announced_tools[id] = true
+					tool_activity.emit(id, tool, "")
+				tool_update.emit(id, tool, describe_input(input), body_for(input))
 	if not texts.is_empty():
 		message_complete.emit("\n\n".join(texts))
 
@@ -199,7 +204,7 @@ func _handle_tool_results(message) -> void:
 				for part in content:
 					if part is Dictionary and part.get("type", "") == "text":
 						text += String(part.get("text", ""))
-			tool_activity.emit("tool error", text.left(200))
+			tool_update.emit(String(block.get("tool_use_id", "")), "", "⚠ " + text.left(160), "")
 
 
 static func _uuid4() -> String:
