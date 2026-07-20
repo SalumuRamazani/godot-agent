@@ -1,26 +1,34 @@
 @tool
 extends VBoxContainer
-## The chat dock. Entirely code-built (no .tscn) so diffs stay reviewable.
-## Wire-up happens in setup(); the plugin adds this control to the right dock.
+## The chat dock, entirely code-built. Visual language: quiet dark chrome from
+## the editor theme, accent used only for the user's own messages and live
+## state; agent output reads like a document, tools render as compact pills.
 
 const EditorContextBuilder := preload("../context/editor_context.gd")
 
 const CLAUDE_MODELS := ["sonnet", "opus", "haiku"]
 const SETTINGS_PATH := "user://godot_agent.cfg"
+const STARTERS := [
+	"Build a small playable demo game in this project, then run it and fix every error.",
+	"Look at my current scene and add game feel: tweens, particles, screen shake.",
+	"Run the game, read the output, and fix every error and warning you find.",
+]
 
 var tools
-var backends := {}          # id -> backend instance
-var backend_ids: Array = [] # display order
+var backends := {}
+var backend_ids: Array = []
 var mcp_port := 0
 
-var _backend  # active backend
+var _backend
 var _backend_id := "claude_code"
 var _cfg := ConfigFile.new()
 
-# header
+# header / config
+var _status_dot: Label
 var _backend_sel: OptionButton
-var _mode_sel: OptionButton      # Plan / Build
-var _perm_sel: OptionButton      # Safe / Auto
+var _mode_build: Button
+var _mode_plan: Button
+var _auto_check: CheckButton
 var _new_btn: Button
 var _claude_model_sel: OptionButton
 var _oc_row: HBoxContainer
@@ -43,14 +51,17 @@ var _status: Label
 var _input: TextEdit
 var _send_btn: Button
 var _stop_btn: Button
+var _working: Label
+var _working_tween: Tween
 
-var _cur_label: RichTextLabel  # streaming assistant bubble
+var _cur_label: RichTextLabel
 var _cur_raw := ""
 var _busy := false
 var _scroll_queued := false
-var _last_tool := ""           # for coalescing repeated tool lines
-var _last_tool_label: Label
-var _last_tool_count := 0
+var _tool_flow: HFlowContainer
+var _last_pill_tool := ""
+var _last_pill_label: Label
+var _last_pill_count := 0
 
 var _re_bold: RegEx
 var _re_inline_code: RegEx
@@ -72,7 +83,29 @@ func _ready() -> void:
 	_build_ui()
 	_apply_settings()
 	_select_backend(_backend_sel.selected)
-	_hello()
+	_welcome()
+
+
+# ------------------------------------------------------------------ theme bits
+
+func _accent() -> Color:
+	if has_theme_color("accent_color", "Editor"):
+		return get_theme_color("accent_color", "Editor")
+	return Color(0.33, 0.56, 0.93)
+
+
+func _mono_font() -> Font:
+	if has_theme_font("source", "EditorFonts"):
+		return get_theme_font("source", "EditorFonts")
+	return get_theme_default_font()
+
+
+func _caption(text: String, font_size := 9) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.add_theme_font_size_override("font_size", font_size)
+	l.modulate = Color(1, 1, 1, 0.38)
+	return l
 
 
 # ------------------------------------------------------------------ UI build
@@ -82,51 +115,76 @@ func _build_ui() -> void:
 	size_flags_vertical = Control.SIZE_EXPAND_FILL
 	add_theme_constant_override("separation", 8)
 
-	# Row A: backend · mode · permission · new
-	var row_a := HBoxContainer.new()
-	row_a.add_theme_constant_override("separation", 6)
-	add_child(row_a)
+	# ── identity row
+	var title_row := HBoxContainer.new()
+	title_row.add_theme_constant_override("separation", 6)
+	add_child(title_row)
+	var title := Label.new()
+	title.text = "⬡ Godot Agent"
+	title.add_theme_font_size_override("font_size", 14)
+	var acc := _accent()
+	title.add_theme_color_override("font_color", Color(acc.r, acc.g, acc.b).lerp(Color.WHITE, 0.55))
+	title_row.add_child(title)
+	_status_dot = Label.new()
+	_status_dot.text = "●"
+	_status_dot.add_theme_font_size_override("font_size", 11)
+	title_row.add_child(_status_dot)
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title_row.add_child(spacer)
+	_new_btn = Button.new()
+	_new_btn.text = "＋ New"
+	_new_btn.flat = true
+	_new_btn.tooltip_text = "Start a fresh conversation"
+	_new_btn.pressed.connect(_on_new_chat)
+	title_row.add_child(_new_btn)
 
+	# ── config row: backend · Build|Plan · Auto
+	var cfg_row := HBoxContainer.new()
+	cfg_row.add_theme_constant_override("separation", 6)
+	add_child(cfg_row)
 	_backend_sel = OptionButton.new()
 	_backend_sel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_backend_sel.fit_to_longest_item = false
 	for id in backend_ids:
 		_backend_sel.add_item(backends[id].display_name())
 	_backend_sel.item_selected.connect(_select_backend)
-	row_a.add_child(_backend_sel)
+	cfg_row.add_child(_backend_sel)
 
-	_mode_sel = OptionButton.new()
-	_mode_sel.add_item("Build")
-	_mode_sel.add_item("Plan")
-	_mode_sel.tooltip_text = "Build: the agent edits files, changes scenes and runs the game.\nPlan: read-only — it explores the project and proposes a plan, touching nothing."
-	_mode_sel.item_selected.connect(func(_i): _apply_backend_options(); _save_settings())
-	row_a.add_child(_mode_sel)
+	var seg := ButtonGroup.new()
+	_mode_build = Button.new()
+	_mode_build.text = "Build"
+	_mode_build.toggle_mode = true
+	_mode_build.button_group = seg
+	_mode_build.button_pressed = true
+	_mode_build.tooltip_text = "The agent edits files, changes scenes and runs the game."
+	_mode_build.toggled.connect(func(on): if on: _mode_changed())
+	cfg_row.add_child(_mode_build)
+	_mode_plan = Button.new()
+	_mode_plan.text = "Plan"
+	_mode_plan.toggle_mode = true
+	_mode_plan.button_group = seg
+	_mode_plan.tooltip_text = "Read-only: explores the project and proposes a plan, touching nothing."
+	_mode_plan.toggled.connect(func(on): if on: _mode_changed())
+	cfg_row.add_child(_mode_plan)
 
-	_perm_sel = OptionButton.new()
-	_perm_sel.add_item("Safe")
-	_perm_sel.add_item("Auto")
-	_perm_sel.tooltip_text = "Safe: file edits and editor tools only; arbitrary shell commands are blocked.\nAuto: full autonomy incl. shell commands — keep your project in git."
-	_perm_sel.item_selected.connect(func(_i): _apply_backend_options(); _save_settings())
-	row_a.add_child(_perm_sel)
+	_auto_check = CheckButton.new()
+	_auto_check.text = "Auto"
+	_auto_check.tooltip_text = "Full autonomy incl. shell commands (Claude: bypassPermissions, opencode: --auto).\nOff = Safe: file edits and editor tools only. Keep your project in git."
+	_auto_check.toggled.connect(func(_on): _apply_backend_options(); _save_settings(); _refresh_status())
+	cfg_row.add_child(_auto_check)
 
-	_new_btn = Button.new()
-	_new_btn.text = "New"
-	_new_btn.tooltip_text = "Start a fresh conversation"
-	_new_btn.pressed.connect(_on_new_chat)
-	row_a.add_child(_new_btn)
-
-	# Row B (claude): model
+	# ── model row (claude)
 	_claude_model_sel = OptionButton.new()
 	for m in CLAUDE_MODELS:
 		_claude_model_sel.add_item(m)
 	_claude_model_sel.item_selected.connect(func(_i): _apply_backend_options(); _save_settings())
 	add_child(_claude_model_sel)
 
-	# Row B (openrouter/opencode): model button · variant · keys
+	# ── model row (openrouter)
 	_oc_row = HBoxContainer.new()
 	_oc_row.add_theme_constant_override("separation", 6)
 	add_child(_oc_row)
-
 	_model_btn = Button.new()
 	_model_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_model_btn.clip_text = true
@@ -134,15 +192,13 @@ func _build_ui() -> void:
 	_model_btn.tooltip_text = "Pick a model — searchable list of everything your keys unlock"
 	_model_btn.pressed.connect(_open_model_picker)
 	_oc_row.add_child(_model_btn)
-
 	_variant_sel = OptionButton.new()
 	_variant_sel.add_item("effort")
 	for v in ["minimal", "low", "medium", "high", "max"]:
 		_variant_sel.add_item(v)
-	_variant_sel.tooltip_text = "Reasoning effort (provider-specific; leave on 'effort' for default)"
+	_variant_sel.tooltip_text = "Reasoning effort (provider-specific)"
 	_variant_sel.item_selected.connect(func(_i): _apply_backend_options(); _save_settings())
 	_oc_row.add_child(_variant_sel)
-
 	_keys_btn = Button.new()
 	_keys_btn.text = "Keys"
 	_keys_btn.tooltip_text = "API keys (OpenRouter etc.) and advanced config"
@@ -152,43 +208,66 @@ func _build_ui() -> void:
 	_build_model_picker()
 	_build_keys_dialog()
 
-	# Chat area
+	# ── chat
 	_scroll = ScrollContainer.new()
 	_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	add_child(_scroll)
-
 	_messages = VBoxContainer.new()
 	_messages.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_messages.add_theme_constant_override("separation", 10)
+	_messages.add_theme_constant_override("separation", 6)
 	_scroll.add_child(_messages)
 
-	_status = Label.new()
-	_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_status.add_theme_font_size_override("font_size", 10)
-	_status.modulate = Color(1, 1, 1, 0.45)
-	add_child(_status)
+	_working = Label.new()
+	_working.text = "●  working…"
+	_working.add_theme_font_size_override("font_size", 11)
+	_working.add_theme_color_override("font_color", _accent())
+	_working.visible = false
+	add_child(_working)
 
+	# ── input
+	var input_panel := PanelContainer.new()
+	var input_style := StyleBoxFlat.new()
+	input_style.bg_color = Color(1, 1, 1, 0.03)
+	input_style.set_corner_radius_all(10)
+	input_style.content_margin_left = 8
+	input_style.content_margin_right = 8
+	input_style.content_margin_top = 8
+	input_style.content_margin_bottom = 8
+	input_panel.add_theme_stylebox_override("panel", input_style)
+	add_child(input_panel)
+	var input_box := VBoxContainer.new()
+	input_box.add_theme_constant_override("separation", 6)
+	input_panel.add_child(input_box)
 	_input = TextEdit.new()
-	_input.custom_minimum_size = Vector2(0, 60)
+	_input.custom_minimum_size = Vector2(0, 56)
 	_input.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
-	_input.placeholder_text = "Ask the agent…  (Enter to send · Shift+Enter for newline)"
+	_input.scroll_fit_content_height = true
+	_input.placeholder_text = "What should we build?"
 	_input.gui_input.connect(_on_input_key)
-	add_child(_input)
-
-	var buttons := HBoxContainer.new()
-	buttons.add_theme_constant_override("separation", 6)
-	add_child(buttons)
-	_send_btn = Button.new()
-	_send_btn.text = "Send"
-	_send_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_send_btn.pressed.connect(_on_send)
-	buttons.add_child(_send_btn)
+	var input_bg := StyleBoxEmpty.new()
+	_input.add_theme_stylebox_override("normal", input_bg)
+	_input.add_theme_stylebox_override("focus", input_bg)
+	input_box.add_child(_input)
+	var btn_row := HBoxContainer.new()
+	btn_row.add_theme_constant_override("separation", 6)
+	input_box.add_child(btn_row)
+	_status = Label.new()
+	_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_status.add_theme_font_size_override("font_size", 10)
+	_status.modulate = Color(1, 1, 1, 0.4)
+	_status.clip_text = true
+	btn_row.add_child(_status)
 	_stop_btn = Button.new()
 	_stop_btn.text = "Stop"
+	_stop_btn.flat = true
 	_stop_btn.disabled = true
 	_stop_btn.pressed.connect(_on_stop)
-	buttons.add_child(_stop_btn)
+	btn_row.add_child(_stop_btn)
+	_send_btn = Button.new()
+	_send_btn.text = "Send  ↵"
+	_send_btn.pressed.connect(_on_send)
+	btn_row.add_child(_send_btn)
 
 
 func _build_model_picker() -> void:
@@ -196,21 +275,19 @@ func _build_model_picker() -> void:
 	_model_dialog.title = "Choose a model"
 	_model_dialog.ok_button_text = "Use model"
 	var box := VBoxContainer.new()
-	box.custom_minimum_size = Vector2(420, 380)
+	box.custom_minimum_size = Vector2(430, 400)
 	box.add_theme_constant_override("separation", 6)
 	_model_filter = LineEdit.new()
-	_model_filter.placeholder_text = "Search… (glm, kimi, deepseek, qwen, free)"
+	_model_filter.placeholder_text = "Search…  glm · kimi · deepseek · qwen · free"
+	_model_filter.clear_button_enabled = true
 	_model_filter.text_changed.connect(func(_t): _refresh_model_list())
 	box.add_child(_model_filter)
 	_model_list = ItemList.new()
 	_model_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_model_list.item_activated.connect(func(_i): _pick_model(); _model_dialog.hide())
 	box.add_child(_model_list)
-	var hint := Label.new()
+	var hint := _caption("opencode/*-free models need no key · add OPENROUTER_API_KEY under Keys for GLM, Kimi and hundreds more", 10)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	hint.add_theme_font_size_override("font_size", 10)
-	hint.modulate = Color(1, 1, 1, 0.55)
-	hint.text = "opencode/*-free models need no key. Add OPENROUTER_API_KEY under Keys to unlock GLM, Kimi and hundreds more."
 	box.add_child(hint)
 	_model_dialog.add_child(box)
 	_model_dialog.confirmed.connect(_pick_model)
@@ -222,7 +299,7 @@ func _open_model_picker() -> void:
 	_all_models.assign(oc.list_models() if oc != null else [])
 	_model_filter.text = ""
 	_refresh_model_list()
-	_model_dialog.popup_centered(Vector2i(460, 460))
+	_model_dialog.popup_centered(Vector2i(470, 480))
 	_model_filter.grab_focus()
 
 
@@ -243,7 +320,7 @@ func _refresh_model_list() -> void:
 	if _model_list.item_count == 0:
 		_model_list.add_item("(nothing matches — no key set yet? See Keys)")
 		_model_list.set_item_disabled(0, true)
-	elif _model_list.item_count > 0:
+	else:
 		_model_list.select(0)
 
 
@@ -310,8 +387,9 @@ func _apply_settings() -> void:
 	var backend_idx := int(_cfg.get_value("ui", "backend", 0))
 	_backend_sel.selected = clampi(backend_idx, 0, backend_ids.size() - 1)
 	_claude_model_sel.selected = maxi(0, CLAUDE_MODELS.find(String(_cfg.get_value("ui", "model", "sonnet"))))
-	_mode_sel.selected = 1 if String(_cfg.get_value("ui", "mode", "build")) == "plan" else 0
-	_perm_sel.selected = 1 if String(_cfg.get_value("ui", "perm", "safe")) == "auto" else 0
+	if String(_cfg.get_value("ui", "mode", "build")) == "plan":
+		_mode_plan.button_pressed = true
+	_auto_check.button_pressed = String(_cfg.get_value("ui", "perm", "safe")) == "auto"
 	_model_btn.text = String(_cfg.get_value("opencode", "model", "opencode/deepseek-v4-flash-free"))
 	var variant := String(_cfg.get_value("opencode", "variant", ""))
 	for i in range(1, _variant_sel.item_count):
@@ -327,8 +405,8 @@ func _apply_settings() -> void:
 func _save_settings() -> void:
 	_cfg.set_value("ui", "backend", _backend_sel.selected)
 	_cfg.set_value("ui", "model", CLAUDE_MODELS[_claude_model_sel.selected])
-	_cfg.set_value("ui", "mode", "plan" if _mode_sel.selected == 1 else "build")
-	_cfg.set_value("ui", "perm", "auto" if _perm_sel.selected == 1 else "safe")
+	_cfg.set_value("ui", "mode", "plan" if _mode_plan.button_pressed else "build")
+	_cfg.set_value("ui", "perm", "auto" if _auto_check.button_pressed else "safe")
 	_cfg.set_value("opencode", "model", _model_btn.text.strip_edges())
 	_cfg.set_value("opencode", "variant", "" if _variant_sel.selected <= 0 else _variant_sel.get_item_text(_variant_sel.selected))
 	_cfg.set_value("opencode", "keys", _keys_edit.text)
@@ -336,11 +414,47 @@ func _save_settings() -> void:
 	_cfg.save(SETTINGS_PATH)
 
 
-func _hello() -> void:
+func _mode_changed() -> void:
+	_auto_check.disabled = _mode_plan.button_pressed
+	_apply_backend_options()
+	_save_settings()
+	_refresh_status()
+
+
+# ------------------------------------------------------------------ welcome
+
+func _welcome() -> void:
+	var card := PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(1, 1, 1, 0.03)
+	style.set_corner_radius_all(10)
+	style.content_margin_left = 12
+	style.content_margin_right = 12
+	style.content_margin_top = 10
+	style.content_margin_bottom = 10
+	card.add_theme_stylebox_override("panel", style)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 6)
+	var head := Label.new()
+	head.text = "What do you want to build?"
+	head.add_theme_font_size_override("font_size", 13)
+	box.add_child(head)
+	for s in STARTERS:
+		var b := Button.new()
+		b.text = "▸ " + s
+		b.flat = true
+		b.clip_text = true
+		b.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		b.tooltip_text = s
+		b.pressed.connect(func():
+			_input.text = s
+			_input.grab_focus())
+		box.add_child(b)
+	card.add_child(box)
+	_messages.add_child(card)
 	var avail: Dictionary = _backend.availability()
-	_add_meta("Ready · MCP 127.0.0.1:%d · try \"Create a scene with a bouncing ball and run it\"" % mcp_port)
 	if _backend_id == "opencode" and not _keys_edit.text.contains("OPENROUTER_API_KEY"):
-		_add_meta("Free opencode/* models work with no key. For GLM/Kimi: Keys → OPENROUTER_API_KEY, then pick under the model button.")
+		_add_meta("Free opencode/* models work with no key · Keys → OPENROUTER_API_KEY unlocks GLM, Kimi & more")
 	if not avail["ok"]:
 		_add_error(String(avail["detail"]))
 
@@ -370,8 +484,8 @@ func _select_backend(idx: int) -> void:
 
 
 func _apply_backend_options() -> void:
-	var plan := _mode_sel.selected == 1
-	var auto := _perm_sel.selected == 1
+	var plan := _mode_plan.button_pressed
+	var auto := _auto_check.button_pressed
 	if _backend_id == "claude_code":
 		_backend.model = CLAUDE_MODELS[_claude_model_sel.selected]
 		if plan:
@@ -392,10 +506,13 @@ func _apply_backend_options() -> void:
 
 func _refresh_status(extra := "") -> void:
 	var avail: Dictionary = _backend.availability()
-	var mode := "Plan" if _mode_sel.selected == 1 else ("Build·Auto" if _perm_sel.selected == 1 else "Build")
-	var text := "MCP :%d · %s · %s" % [mcp_port, mode, "ready" if avail["ok"] else "CLI missing"]
+	_status_dot.add_theme_color_override("font_color",
+		Color(0.36, 0.78, 0.42) if avail["ok"] else Color(0.9, 0.4, 0.35))
+	_status_dot.tooltip_text = String(avail["detail"])
+	var mode := "Plan" if _mode_plan.button_pressed else ("Build · Auto" if _auto_check.button_pressed else "Build · Safe")
+	var text := "%s  ·  MCP :%d" % [mode, mcp_port]
 	if extra != "":
-		text += " · " + extra
+		text += "  ·  " + extra
 	_status.text = text
 	_status.tooltip_text = String(avail["detail"])
 
@@ -439,15 +556,24 @@ func _on_new_chat() -> void:
 		c.queue_free()
 	_cur_label = null
 	_cur_raw = ""
-	_reset_tool_coalescing()
-	_hello()
+	_reset_pills()
+	_welcome()
 
 
 func _set_busy(b: bool) -> void:
 	_busy = b
 	_send_btn.disabled = b
 	_stop_btn.disabled = not b
-	if not b:
+	_working.visible = b
+	if _working_tween != null:
+		_working_tween.kill()
+		_working_tween = null
+	if b:
+		_working.modulate.a = 1.0
+		_working_tween = create_tween().set_loops()
+		_working_tween.tween_property(_working, "modulate:a", 0.25, 0.6)
+		_working_tween.tween_property(_working, "modulate:a", 1.0, 0.6)
+	else:
 		_refresh_status()
 
 
@@ -458,7 +584,7 @@ func _on_backend_status(text: String) -> void:
 
 
 func _on_backend_stream_delta(text: String) -> void:
-	_reset_tool_coalescing()
+	_reset_pills()
 	if _cur_label == null:
 		_begin_assistant_bubble()
 	_cur_raw += text
@@ -467,7 +593,7 @@ func _on_backend_stream_delta(text: String) -> void:
 
 
 func _on_backend_message_complete(full_text: String) -> void:
-	_reset_tool_coalescing()
+	_reset_pills()
 	if _cur_label == null:
 		_begin_assistant_bubble()
 	_cur_raw = full_text
@@ -479,31 +605,49 @@ func _on_backend_message_complete(full_text: String) -> void:
 func _on_backend_tool_activity(tool_name: String, detail: String) -> void:
 	_finalize_stream()
 	var short_name := tool_name.replace("mcp__godot_editor__", "").replace("godot_editor_", "")
-	if detail == "" and short_name == _last_tool and _last_tool_label != null and is_instance_valid(_last_tool_label):
-		_last_tool_count += 1
-		_last_tool_label.text = "⚙ %s ×%d" % [short_name, _last_tool_count]
+	if detail == "" and short_name == _last_pill_tool and _last_pill_label != null and is_instance_valid(_last_pill_label):
+		_last_pill_count += 1
+		_last_pill_label.text = "%s ×%d" % [short_name, _last_pill_count]
 		return
+	if _tool_flow == null or not is_instance_valid(_tool_flow):
+		_tool_flow = HFlowContainer.new()
+		_tool_flow.add_theme_constant_override("h_separation", 4)
+		_tool_flow.add_theme_constant_override("v_separation", 4)
+		_messages.add_child(_tool_flow)
+	var pill := PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(1, 1, 1, 0.06)
+	style.set_corner_radius_all(9)
+	style.content_margin_left = 8
+	style.content_margin_right = 8
+	style.content_margin_top = 2
+	style.content_margin_bottom = 2
+	pill.add_theme_stylebox_override("panel", style)
 	var label := Label.new()
-	label.text = "⚙ " + short_name + ("   " + detail if detail != "" else "")
-	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	label.add_theme_font_size_override("font_size", 11)
-	label.modulate = Color(1, 1, 1, 0.55)
-	_messages.add_child(label)
-	_last_tool = short_name if detail == "" else ""
-	_last_tool_label = label
-	_last_tool_count = 1
+	label.text = short_name + (("  " + detail.left(60)) if detail != "" else "")
+	label.add_theme_font_size_override("font_size", 10)
+	label.add_theme_font_override("font", _mono_font())
+	label.modulate = Color(1, 1, 1, 0.7)
+	if detail != "":
+		label.tooltip_text = detail
+	pill.add_child(label)
+	_tool_flow.add_child(pill)
+	_last_pill_tool = short_name if detail == "" else ""
+	_last_pill_label = label
+	_last_pill_count = 1
 	_queue_scroll()
 
 
-func _reset_tool_coalescing() -> void:
-	_last_tool = ""
-	_last_tool_label = null
-	_last_tool_count = 0
+func _reset_pills() -> void:
+	_tool_flow = null
+	_last_pill_tool = ""
+	_last_pill_label = null
+	_last_pill_count = 0
 
 
 func _on_backend_turn_done(meta: Dictionary) -> void:
 	_finalize_stream()
-	_reset_tool_coalescing()
+	_reset_pills()
 	if meta.get("is_error", false):
 		_add_error("turn ended with an error (%s): %s" % [meta.get("subtype", "?"), String(meta.get("result", "")).left(300)])
 	var bits: Array[String] = []
@@ -513,7 +657,7 @@ func _on_backend_turn_done(meta: Dictionary) -> void:
 		bits.append("%d steps" % int(meta["num_turns"]))
 	if int(meta.get("duration_ms", 0)) > 0:
 		bits.append("%.1fs" % (int(meta["duration_ms"]) / 1000.0))
-	_add_meta("✓ done" + ("  ·  " + "  ·  ".join(bits) if not bits.is_empty() else ""))
+	_add_meta("✓ done" + ("   " + "  ·  ".join(bits) if not bits.is_empty() else ""))
 	_set_busy(false)
 	if tools != null and tools.editor_enabled:
 		tools.call_tool("refresh_filesystem", {})
@@ -522,39 +666,13 @@ func _on_backend_turn_done(meta: Dictionary) -> void:
 
 func _on_backend_error(message: String) -> void:
 	_finalize_stream()
-	_reset_tool_coalescing()
+	_reset_pills()
 	_add_error(message)
 	_set_busy(false)
 	_queue_scroll()
 
 
 # ------------------------------------------------------------------ bubbles
-
-func _accent() -> Color:
-	if has_theme_color("accent_color", "Editor"):
-		return get_theme_color("accent_color", "Editor")
-	return Color(0.26, 0.5, 0.9)
-
-
-func _panel(bg: Color, border_accent := false) -> PanelContainer:
-	var panel := PanelContainer.new()
-	var style := StyleBoxFlat.new()
-	style.bg_color = bg
-	style.set_corner_radius_all(8)
-	style.content_margin_left = 10
-	style.content_margin_right = 10
-	style.content_margin_top = 8
-	style.content_margin_bottom = 8
-	if border_accent:
-		var a := _accent()
-		a.a = 0.35
-		style.border_color = a
-		style.border_width_left = 2
-	panel.add_theme_stylebox_override("panel", style)
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_messages.add_child(panel)
-	return panel
-
 
 func _rich_label(bbcode: bool) -> RichTextLabel:
 	var label := RichTextLabel.new()
@@ -569,16 +687,47 @@ func _rich_label(bbcode: bool) -> RichTextLabel:
 
 
 func _add_user_bubble(text: String) -> void:
+	_messages.add_child(_caption("YOU"))
+	var wrap := MarginContainer.new()
+	wrap.add_theme_constant_override("margin_left", 24)
+	var panel := PanelContainer.new()
+	var style := StyleBoxFlat.new()
 	var c := _accent()
-	c.a = 0.16
+	c.a = 0.14
+	style.bg_color = c
+	style.set_corner_radius_all(10)
+	style.content_margin_left = 10
+	style.content_margin_right = 10
+	style.content_margin_top = 7
+	style.content_margin_bottom = 7
+	panel.add_theme_stylebox_override("panel", style)
+	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var label := _rich_label(false)
 	label.text = text
-	_panel(c).add_child(label)
+	panel.add_child(label)
+	wrap.add_child(panel)
+	_messages.add_child(wrap)
 
 
 func _begin_assistant_bubble() -> void:
+	_messages.add_child(_caption("AGENT"))
+	var panel := PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(1, 1, 1, 0.025)
+	style.set_corner_radius_all(10)
+	style.content_margin_left = 10
+	style.content_margin_right = 10
+	style.content_margin_top = 7
+	style.content_margin_bottom = 7
+	var a := _accent()
+	a.a = 0.4
+	style.border_color = a
+	style.border_width_left = 2
+	panel.add_theme_stylebox_override("panel", style)
+	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var label := _rich_label(true)
-	_panel(Color(1, 1, 1, 0.04), true).add_child(label)
+	panel.add_child(label)
+	_messages.add_child(panel)
 	_cur_label = label
 	_cur_raw = ""
 
@@ -587,24 +736,37 @@ func _finalize_stream() -> void:
 	if _cur_label != null and _cur_raw.strip_edges() == "":
 		var panel := _cur_label.get_parent()
 		if panel != null:
+			var i := panel.get_index()
+			if i > 0:
+				var prev := _messages.get_child(i - 1)
+				if prev is Label and prev.text == "AGENT":
+					prev.queue_free()
 			panel.queue_free()
 	_cur_label = null
 	_cur_raw = ""
 
 
 func _add_error(text: String) -> void:
+	var panel := PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0.8, 0.2, 0.18, 0.16)
+	style.set_corner_radius_all(10)
+	style.content_margin_left = 10
+	style.content_margin_right = 10
+	style.content_margin_top = 7
+	style.content_margin_bottom = 7
+	panel.add_theme_stylebox_override("panel", style)
+	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var label := _rich_label(false)
-	label.text = "⚠ " + text
-	_panel(Color(0.8, 0.15, 0.15, 0.2)).add_child(label)
+	label.text = "⚠  " + text
+	panel.add_child(label)
+	_messages.add_child(panel)
 	_queue_scroll()
 
 
 func _add_meta(text: String) -> void:
-	var label := Label.new()
-	label.text = text
+	var label := _caption(text, 10)
 	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	label.add_theme_font_size_override("font_size", 10)
-	label.modulate = Color(1, 1, 1, 0.45)
 	_messages.add_child(label)
 	_queue_scroll()
 
@@ -625,25 +787,25 @@ func _scroll_to_bottom() -> void:
 
 # ------------------------------------------------------------------ markdown
 
-## Minimal, safe markdown→bbcode: escapes all incoming brackets, then applies
-## fenced code blocks, inline code and bold. Anything else stays plain text.
+## Minimal, safe markdown→bbcode: escape brackets, then fenced code (mono on a
+## dark backdrop), inline code, bold, headers.
 func _md_to_bbcode(md: String) -> String:
 	var out := ""
 	var in_code := false
 	for raw_line in md.split("\n"):
 		var line: String = raw_line
 		if line.strip_edges().begins_with("```"):
-			out += "[code]" if not in_code else "[/code]"
+			out += "[bgcolor=#00000042][code]" if not in_code else "[/code][/bgcolor]"
 			in_code = not in_code
 			out += "\n"
 			continue
 		line = line.replace("[", "[lb]")
 		if not in_code:
-			line = _re_inline_code.sub(line, "[code]$1[/code]", true)
+			line = _re_inline_code.sub(line, "[bgcolor=#00000042][code]$1[/code][/bgcolor]", true)
 			line = _re_bold.sub(line, "[b]$1[/b]", true)
 			if line.begins_with("# ") or line.begins_with("## ") or line.begins_with("### "):
 				line = "[b]" + line.lstrip("# ") + "[/b]"
 		out += line + "\n"
 	if in_code:
-		out += "[/code]"
+		out += "[/code][/bgcolor]"
 	return out.rstrip("\n")

@@ -72,6 +72,23 @@ func list_tools() -> Array:
 			{"scene": {"type": "string"}}, []),
 		_def("stop_playing", "Stop the scene playing in the editor.", {}, []),
 		_def("refresh_filesystem", "Rescan the project filesystem so files created/edited outside the editor appear. Call after using your file tools.", {}, []),
+		_def("instance_scene", "Instantiate a saved .tscn as a child inside the currently edited scene (proper scene composition — prefer this over duplicating nodes).",
+			{"scene_path": {"type": "string"}, "parent_path": {"type": "string", "description": "'' or '.' = scene root"},
+			 "node_name": {"type": "string"}, "properties": {"type": "object"}, "save": {"type": "boolean"}}, ["scene_path"]),
+		_def("connect_signal", "Create a persistent signal connection between two nodes in the edited scene (saved into the .tscn, like the editor's Node panel). The target method should exist in the target's script.",
+			{"source_path": {"type": "string"}, "signal_name": {"type": "string"},
+			 "target_path": {"type": "string"}, "method": {"type": "string"}, "save": {"type": "boolean"}},
+			["source_path", "signal_name", "target_path", "method"]),
+		_def("add_input_action", "Create/replace an input action in the project's Input Map with key and/or mouse bindings, e.g. action 'jump' with keys ['Space','W']. Saves project.godot.",
+			{"action": {"type": "string"},
+			 "keys": {"type": "array", "items": {"type": "string"}, "description": "Key names: 'Space', 'A', 'Left', 'Shift', 'Escape', …"},
+			 "mouse_button": {"type": "integer", "description": "Optional: 1=left, 2=right, 3=middle"}}, ["action"]),
+		_def("set_project_setting", "Set a project setting and save project.godot. E.g. 'application/run/main_scene' = 'res://main.tscn', 'display/window/size/viewport_width' = 1280.",
+			{"setting": {"type": "string"}, "value": {"description": "New value (string/number/bool)"}}, ["setting", "value"]),
+		_def("get_project_setting", "Read a project setting (e.g. 'application/run/main_scene').",
+			{"setting": {"type": "string"}}, ["setting"]),
+		_def("get_node_properties", "Current non-default property values of a node in the edited scene (what the Inspector shows changed).",
+			{"node_path": {"type": "string"}}, ["node_path"]),
 	]
 
 
@@ -132,6 +149,21 @@ func call_tool(tool_name: String, args: Dictionary) -> Dictionary:
 		"refresh_filesystem":
 			EditorInterface.get_resource_filesystem().scan()
 			return _ok("Filesystem rescan started.")
+		"instance_scene":
+			return _instance_scene(args)
+		"connect_signal":
+			return _connect_signal(args)
+		"add_input_action":
+			return _add_input_action(args)
+		"set_project_setting":
+			return _set_project_setting(args)
+		"get_project_setting":
+			var s := String(args.get("setting", ""))
+			if not ProjectSettings.has_setting(s):
+				return _ok("(setting not set: %s)" % s)
+			return _ok(var_to_str(ProjectSettings.get_setting(s)))
+		"get_node_properties":
+			return _get_node_properties(args)
 		_:
 			return _err("unknown tool: " + tool_name)
 
@@ -550,6 +582,130 @@ func _stop_run() -> Dictionary:
 		return _ok("No run is active.")
 	run_proc.kill()
 	return _ok("Kill signal sent to pid %d." % run_proc.pid)
+
+
+func _instance_scene(args: Dictionary) -> Dictionary:
+	var root := _edited_root()
+	if root == null:
+		return _err("no scene is being edited; open or create one first")
+	var scene_path := String(args.get("scene_path", ""))
+	if not ResourceLoader.exists(scene_path):
+		return _err("scene not found: " + scene_path)
+	if root.scene_file_path == scene_path:
+		return _err("cannot instance a scene into itself")
+	var parent := _resolve(String(args.get("parent_path", "")))
+	if parent == null:
+		return _err("parent not found: " + String(args.get("parent_path", "")))
+	var ps: PackedScene = load(scene_path)
+	if ps == null:
+		return _err("could not load: " + scene_path)
+	var node := ps.instantiate()
+	var node_name := String(args.get("node_name", ""))
+	if node_name != "":
+		node.name = node_name
+	parent.add_child(node)
+	node.owner = root
+	var prop_report := ""
+	var props = args.get("properties", {})
+	if props is Dictionary and not props.is_empty():
+		prop_report = " " + _apply_properties(node, props) + "."
+	var saved := _maybe_save(args)
+	return _ok("Instanced %s as %s under %s.%s%s" % [scene_path, node.name, _path_in_scene(root, parent), prop_report, saved])
+
+
+func _connect_signal(args: Dictionary) -> Dictionary:
+	var root := _edited_root()
+	var src := _resolve(String(args.get("source_path", "")))
+	var tgt := _resolve(String(args.get("target_path", "")))
+	if src == null:
+		return _err("source not found: " + String(args.get("source_path", "")))
+	if tgt == null:
+		return _err("target not found: " + String(args.get("target_path", "")))
+	var sig := String(args.get("signal_name", ""))
+	if not src.has_signal(sig):
+		var sigs := src.get_signal_list().map(func(s): return s["name"])
+		return _err("no signal '%s' on %s. Available: %s" % [sig, src.name, ", ".join(sigs.slice(0, 25))])
+	var method := String(args.get("method", ""))
+	var callable := Callable(tgt, method)
+	if src.is_connected(sig, callable):
+		return _ok("Already connected: %s.%s -> %s.%s" % [src.name, sig, tgt.name, method])
+	var err := src.connect(sig, callable, CONNECT_PERSIST)
+	if err != OK:
+		return _err("connect failed (%d)" % err)
+	var note := "" if tgt.get_script() != null and tgt.get_script().get_script_method_list().any(func(m): return m["name"] == method) \
+		else " NOTE: method '%s' not found in the target's script yet — create it or the game will error." % method
+	var saved := _maybe_save(args)
+	return _ok("Connected %s.%s -> %s.%s (persistent).%s%s" % [src.name, sig, tgt.name, method, note, saved])
+
+
+func _add_input_action(args: Dictionary) -> Dictionary:
+	var action := String(args.get("action", "")).strip_edges()
+	if action == "":
+		return _err("action name is required")
+	var events := []
+	var bad: Array[String] = []
+	for k in args.get("keys", []):
+		var code := OS.find_keycode_from_string(String(k))
+		if code == KEY_NONE:
+			bad.append(String(k))
+			continue
+		var ev := InputEventKey.new()
+		ev.physical_keycode = code
+		events.append(ev)
+	var mb := int(args.get("mouse_button", 0))
+	if mb > 0:
+		var mev := InputEventMouseButton.new()
+		mev.button_index = mb
+		events.append(mev)
+	if events.is_empty():
+		return _err("no valid bindings%s" % ((" (unknown keys: " + ", ".join(bad) + ")") if not bad.is_empty() else ""))
+	ProjectSettings.set_setting("input/" + action, {"deadzone": 0.2, "events": events})
+	var err := ProjectSettings.save()
+	if err != OK:
+		return _err("could not save project.godot (%d)" % err)
+	var extra := ("" if bad.is_empty() else " Unknown keys skipped: " + ", ".join(bad) + ".")
+	return _ok("Input action '%s' saved with %d binding(s).%s" % [action, events.size(), extra])
+
+
+func _set_project_setting(args: Dictionary) -> Dictionary:
+	var setting := String(args.get("setting", ""))
+	if setting == "":
+		return _err("setting is required")
+	var value = args.get("value")
+	if value is String:
+		var parsed = str_to_var(value)
+		if parsed != null and not (parsed is String) and not value.begins_with("res://") and not value.begins_with("uid://"):
+			value = parsed
+	ProjectSettings.set_setting(setting, value)
+	var err := ProjectSettings.save()
+	if err != OK:
+		return _err("could not save project.godot (%d)" % err)
+	return _ok("%s = %s (saved)" % [setting, var_to_str(value)])
+
+
+func _get_node_properties(args: Dictionary) -> Dictionary:
+	var node := _resolve(String(args.get("node_path", "")))
+	if node == null:
+		return _err("node not found: " + String(args.get("node_path", "")))
+	var lines: Array[String] = []
+	lines.append("%s (%s)" % [node.name, node.get_class()])
+	for p in node.get_property_list():
+		if not (int(p["usage"]) & PROPERTY_USAGE_STORAGE):
+			continue
+		var prop := String(p["name"])
+		if prop.begins_with("_") or prop in ["script", "owner", "scene_file_path"]:
+			continue
+		var value = node.get(prop)
+		var default = ClassDB.class_get_property_default_value(node.get_class(), prop)
+		if str(value) == str(default):
+			continue
+		lines.append("  %s = %s" % [prop, var_to_str(value).left(120)])
+		if lines.size() >= 60:
+			lines.append("  … (truncated)")
+			break
+	if node.get_script() != null:
+		lines.append("  script = " + str(node.get_script().resource_path))
+	return _ok("\n".join(lines))
 
 
 func _play_in_editor(args: Dictionary) -> Dictionary:
