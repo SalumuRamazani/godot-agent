@@ -10,9 +10,14 @@ const ProcRunner := preload("../util/proc_runner.gd")
 const MAX_TREE_NODES := 300
 const MAX_RUN_LINES := 2000
 
+signal approval_requested(ticket: String, tool_name: String, summary: String)
+
 var editor_enabled := true
 var run_proc  # ProcRunner while the game is running via run_project
 var run_output: Array[String] = []
+var server  # mcp/http_server.gd — needed to complete async (approval) responses
+var pending_approvals := {}  # ticket -> {"tool": String, "input": Dictionary}
+var _input_seq := 0
 
 
 func pump() -> void:
@@ -24,6 +29,22 @@ func shutdown() -> void:
 	if run_proc != null:
 		run_proc.shutdown()
 		run_proc = null
+	server = null
+	pending_approvals.clear()
+
+
+## Called by the dock when the user clicks Allow or Deny.
+func resolve_approval(ticket: String, allow: bool) -> void:
+	var req = pending_approvals.get(ticket)
+	if req == null or server == null:
+		return
+	pending_approvals.erase(ticket)
+	var payload: Dictionary
+	if allow:
+		payload = {"behavior": "allow", "updatedInput": req["input"]}
+	else:
+		payload = {"behavior": "deny", "message": "The user denied this action in the Godot Agent dock."}
+	server.complete_async(ticket, {"text": JSON.stringify(payload), "is_error": false})
 
 
 # ---------------------------------------------------------------- tool list
@@ -31,8 +52,10 @@ func shutdown() -> void:
 func list_tools() -> Array:
 	if not editor_enabled:
 		return [_def("echo", "Echo back the given text (test tool).",
-			{"text": {"type": "string"}}, ["text"])]
+			{"text": {"type": "string"}}, ["text"]),
+			_approve_def()]
 	return [
+		_approve_def(),
 		_def("get_editor_state", "Snapshot of the editor: edited scene, open scenes, selected nodes, current script, whether the game is playing, project root and Godot version.", {}, []),
 		_def("get_scene_tree", "Node tree of a scene as indented text: name (Type) [script]. Omit scene_path for the currently edited scene.",
 			{"scene_path": {"type": "string", "description": "res:// path of a .tscn; omit for the edited scene"}}, []),
@@ -89,10 +112,17 @@ func list_tools() -> Array:
 			{"setting": {"type": "string"}}, ["setting"]),
 		_def("get_node_properties", "Current non-default property values of a node in the edited scene (what the Inspector shows changed).",
 			{"node_path": {"type": "string"}}, ["node_path"]),
-		_def("get_game_screenshot", "SEE the running game: returns the latest screenshot (refreshed every second) of the game started with run_project. Wait ~2s after starting before the first call. Use it to verify visuals, layout and that things actually appear.", {}, []),
+		_def("get_game_screenshot", "SEE the running game: returns the latest screenshot (refreshed every second) of the game started with run_project, plus its FPS. Wait ~2s after starting before the first call. Use it to verify visuals, layout and that things actually appear.", {}, []),
 		_def("screenshot_editor", "SEE the editor viewport (the scene as the user sees it while editing). view: '2d' or '3d' (default 3d).",
 			{"view": {"type": "string"}}, []),
+		_def("play_input", "PLAY the running game by simulating input. steps is an array executed in order; each step is one of: {\"action\":\"jump\",\"hold_ms\":150} tap/hold an Input Map action; {\"action\":\"move_right\",\"down\":true} press without releasing (parallel holds — release later with down:false); {\"wait_ms\":500}; {\"mouse_click\":[x,y]}; {\"mouse_move\":[x,y]}. Actions must exist in the Input Map. Returns the estimated duration — wait that long, then get_game_screenshot and get_run_output to see what happened. Playtest every gameplay feature you build.",
+			{"steps": {"type": "array", "items": {"type": "object"}}}, ["steps"]),
 	]
+
+
+func _approve_def() -> Dictionary:
+	return _def("approve", "Internal permission gate used by the Claude Code harness in Safe mode. NEVER call this tool yourself.",
+		{"tool_name": {"type": "string"}, "input": {"type": "object"}}, [])
 
 
 func _def(tool_name: String, desc: String, props: Dictionary, required: Array) -> Dictionary:
@@ -106,11 +136,13 @@ func _def(tool_name: String, desc: String, props: Dictionary, required: Array) -
 # ---------------------------------------------------------------- dispatch
 
 func call_tool(tool_name: String, args: Dictionary) -> Dictionary:
-	if not editor_enabled and tool_name != "echo":
+	if not editor_enabled and not (tool_name in ["echo", "approve"]):
 		return _err("editor tools unavailable in headless mode")
 	match tool_name:
 		"echo":
 			return _ok(String(args.get("text", "")))
+		"approve":
+			return _approve(args)
 		"get_editor_state":
 			return _get_editor_state()
 		"get_scene_tree":
@@ -171,8 +203,24 @@ func call_tool(tool_name: String, args: Dictionary) -> Dictionary:
 			return _get_game_screenshot()
 		"screenshot_editor":
 			return _screenshot_editor(args)
+		"play_input":
+			return _play_input(args)
 		_:
 			return _err("unknown tool: " + tool_name)
+
+
+func _approve(args: Dictionary) -> Dictionary:
+	var req_tool := String(args.get("tool_name", "?"))
+	var input = args.get("input", {})
+	if not (input is Dictionary):
+		input = {}
+	var ticket := "%d_%d" % [Time.get_ticks_usec(), randi() % 100000]
+	pending_approvals[ticket] = {"tool": req_tool, "input": input}
+	var summary := String(input.get("command", input.get("description", "")))
+	if summary == "":
+		summary = JSON.stringify(input).left(200)
+	approval_requested.emit(ticket, req_tool, summary)
+	return {"async_ticket": ticket}
 
 
 func _ok(text: String) -> Dictionary:
@@ -564,6 +612,8 @@ func _run_project(args: Dictionary) -> Dictionary:
 	var scene := String(args.get("scene", ""))
 	if scene != "":
 		run_args.append(scene)
+	for stale in ["frame_latest.png", "status.json", "input_cmd.json", "input_done.json"]:
+		DirAccess.remove_absolute(_frames_dir().path_join(stale))
 	run_args.append_array(PackedStringArray(["--", "--ga-frames=" + _frames_dir()]))
 	var err: int = run_proc.start(OS.get_executable_path(), run_args)
 	if err != OK:
@@ -733,7 +783,34 @@ func _get_game_screenshot() -> Dictionary:
 	var note := "Screenshot of the running game (saved at %s)." % path
 	if age > 5:
 		note += " WARNING: frame is %ds old — the game may have stopped or crashed; check get_run_output." % age
+	var status = JSON.parse_string(FileAccess.get_file_as_string(_frames_dir().path_join("status.json")))
+	if status is Dictionary:
+		note += " Game FPS: %d." % int(status.get("fps", 0))
+	var done = JSON.parse_string(FileAccess.get_file_as_string(_frames_dir().path_join("input_done.json")))
+	if done is Dictionary:
+		note += " Input sequence #%d completed." % int(done.get("seq", 0))
 	return {"text": note, "is_error": false, "image_b64": Marshalls.raw_to_base64(bytes)}
+
+
+func _play_input(args: Dictionary) -> Dictionary:
+	if run_proc == null or not run_proc.running:
+		return _err("no game running — start it with run_project first")
+	var steps = args.get("steps", [])
+	if not (steps is Array) or steps.is_empty():
+		return _err("steps must be a non-empty array")
+	if steps.size() > 100:
+		return _err("too many steps (max 100)")
+	_input_seq += 1
+	var f := FileAccess.open(_frames_dir().path_join("input_cmd.json"), FileAccess.WRITE)
+	if f == null:
+		return _err("could not write the input command file")
+	f.store_string(JSON.stringify({"seq": _input_seq, "steps": steps}))
+	f = null
+	var est := 300
+	for s in steps:
+		if s is Dictionary:
+			est += int(s.get("hold_ms", 0)) + int(s.get("wait_ms", 0)) + (80 if s.has("mouse_click") else 0)
+	return _ok("Input sequence #%d dispatched (~%dms incl. pickup delay). Wait that long, then get_game_screenshot (it will confirm 'sequence #%d completed') and get_run_output." % [_input_seq, est, _input_seq])
 
 
 func _screenshot_editor(args: Dictionary) -> Dictionary:

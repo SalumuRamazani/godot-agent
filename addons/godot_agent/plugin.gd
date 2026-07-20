@@ -25,6 +25,7 @@ func _enter_tree() -> void:
 	tools = McpTools.new()
 	server = McpServer.new()
 	server.tools = tools
+	tools.server = server  # for async (approval) responses; both cleared on exit
 	if server.start(8765) != OK:
 		push_error("Godot Agent: could not bind any MCP port in 8765-8774; agent tools will be unavailable")
 	_write_backend_configs()

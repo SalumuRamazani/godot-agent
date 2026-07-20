@@ -15,6 +15,7 @@ var tools  # mcp/tools.gd instance (duck-typed: list_tools(), call_tool())
 
 var _server := TCPServer.new()
 var _conns: Array[Dictionary] = []
+var _pending := {}  # async ticket -> {"conn": Dictionary, "id": Variant}
 
 
 func start(preferred: int = 8765, tries: int = 10) -> Error:
@@ -30,8 +31,23 @@ func stop() -> void:
 		var peer: StreamPeerTCP = c["peer"]
 		peer.disconnect_from_host()
 	_conns.clear()
+	_pending.clear()
+	tools = null
 	_server.stop()
 	port = 0
+
+
+## Finish a parked (async) tools/call — e.g. once the user clicks Allow/Deny.
+func complete_async(ticket: String, out: Dictionary) -> void:
+	var entry = _pending.get(ticket)
+	if entry == null:
+		return
+	_pending.erase(ticket)
+	var envelope := _result(entry["id"], {
+		"content": [{"type": "text", "text": String(out.get("text", ""))}],
+		"isError": bool(out.get("is_error", false)),
+	})
+	_respond(entry["conn"], 200, JSON.stringify(envelope))
 
 
 func poll() -> void:
@@ -51,9 +67,13 @@ func _poll_conn(c: Dictionary) -> void:
 	var status := peer.get_status()
 	if status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE:
 		c["done"] = true
+		if c.has("ticket"):
+			_pending.erase(c["ticket"])  # client gave up while parked
 		return
 	if status != StreamPeerTCP.STATUS_CONNECTED:
 		return
+	if c["stage"] == "parked":
+		return  # waiting for complete_async
 	var avail := peer.get_available_bytes()
 	if avail > 0:
 		var res := peer.get_data(avail)
@@ -122,7 +142,7 @@ func _handle_jsonrpc(c: Dictionary, body: String) -> void:
 		var responses := []
 		for msg in parsed:
 			if msg is Dictionary and msg.has("id"):
-				responses.append(_dispatch(msg))
+				responses.append(_dispatch(msg, {}))
 		if responses.is_empty():
 			_respond(c, 202, "")
 		else:
@@ -134,10 +154,14 @@ func _handle_jsonrpc(c: Dictionary, body: String) -> void:
 	if not parsed.has("id"):
 		_respond(c, 202, "")  # notification (e.g. notifications/initialized)
 		return
-	_respond(c, 200, JSON.stringify(_dispatch(parsed)))
+	var envelope := _dispatch(parsed, c)
+	if envelope.get("__parked", false):
+		c["stage"] = "parked"
+		return
+	_respond(c, 200, JSON.stringify(envelope))
 
 
-func _dispatch(msg: Dictionary) -> Dictionary:
+func _dispatch(msg: Dictionary, conn: Dictionary) -> Dictionary:
 	var id = msg.get("id")
 	var method := String(msg.get("method", ""))
 	var params = msg.get("params", {})
@@ -163,6 +187,13 @@ func _dispatch(msg: Dictionary) -> Dictionary:
 			if not (args is Dictionary):
 				args = {}
 			var out: Dictionary = tools.call_tool(tool_name, args)
+			if String(out.get("async_ticket", "")) != "":
+				if conn.is_empty():
+					return {"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "async tools unsupported in batch requests"}}
+				var ticket := String(out["async_ticket"])
+				conn["ticket"] = ticket
+				_pending[ticket] = {"conn": conn, "id": id}
+				return {"__parked": true}
 			var content := []
 			if String(out.get("image_b64", "")) != "":
 				content.append({"type": "image", "data": String(out["image_b64"]), "mimeType": "image/png"})

@@ -64,6 +64,10 @@ func send(prompt: String) -> void:
 			"--strict-mcp-config",
 			"--allowedTools", "mcp__godot_editor",
 		]))
+		if permission_mode == "acceptEdits":
+			# Safe mode: route permission requests (e.g. shell commands) to the
+			# in-editor Allow/Deny dialog instead of silently denying them.
+			args.append_array(PackedStringArray(["--permission-prompt-tool", "mcp__godot_editor__approve"]))
 	if first_turn:
 		args.append_array(PackedStringArray(["--session-id", session_id]))
 	else:
@@ -75,7 +79,8 @@ func send(prompt: String) -> void:
 	_proc.line_out.connect(_handle_line)
 	_proc.line_err.connect(_handle_stderr)
 	_proc.finished.connect(_handle_finished)
-	var err: int = _proc.start(String(avail["detail"]), args, project_dir)
+	# Generous MCP tool timeout so an approval dialog can sit unanswered a while.
+	var err: int = _proc.start(String(avail["detail"]), args, project_dir, {"MCP_TOOL_TIMEOUT": "600000"})
 	if err != OK:
 		error.emit("failed to start claude (%d)" % err)
 		_proc = null

@@ -25,3 +25,4 @@ GodotAgentProbe="*uid://dwoi2wgkhxxek"
 [editor_plugins]
 
 enabled=PackedStringArray("res://addons/godot_agent/plugin.cfg")
+

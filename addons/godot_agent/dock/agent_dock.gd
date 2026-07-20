@@ -69,6 +69,8 @@ var _think_body: RichTextLabel
 var _think_raw := ""
 var _history_btn: MenuButton
 var _history_ids: Array[String] = []
+var _approval_queue: Array = []
+var _approval_dialog: ConfirmationDialog
 var _chat := {}            # current persisted conversation (chat_store.gd)
 var _rec_by_call := {}     # call_id -> index into _chat.messages
 var _restoring := false
@@ -94,6 +96,8 @@ func _ready() -> void:
 	_build_ui()
 	_apply_settings()
 	_select_backend(_backend_sel.selected)
+	if tools != null and tools.has_signal("approval_requested"):
+		tools.approval_requested.connect(_on_approval_requested)
 	_restore_latest()
 
 
@@ -662,6 +666,46 @@ func _load_chat(id: String) -> void:
 			_backend.first_turn = false
 	_add_meta("↺ restored (%s)%s" % [_rel_date(int(chat.get("updated", 0))), " · same agent session continues" if sid != "" else ""])
 	_queue_scroll()
+
+
+# ------------------------------------------------------------------ approvals
+
+func _on_approval_requested(ticket: String, tool_name: String, summary: String) -> void:
+	_approval_queue.append({"ticket": ticket, "tool": tool_name, "summary": summary})
+	_show_next_approval()
+
+
+func _show_next_approval() -> void:
+	if _approval_dialog != null and is_instance_valid(_approval_dialog):
+		return
+	if _approval_queue.is_empty():
+		return
+	var req: Dictionary = _approval_queue.pop_front()
+	var d := ConfirmationDialog.new()
+	d.title = "Agent asks permission"
+	d.ok_button_text = "Allow"
+	d.cancel_button_text = "Deny"
+	d.dialog_text = "The agent wants to use %s:\n\n%s\n\nAllow it this once?" % [String(req["tool"]), String(req["summary"]).left(400)]
+	d.dialog_autowrap = true
+	d.min_size = Vector2i(460, 0)
+	add_child(d)
+	_approval_dialog = d
+	d.confirmed.connect(func(): _resolve_approval(req, true))
+	d.canceled.connect(func(): _resolve_approval(req, false))
+	d.popup_centered()
+
+
+func _resolve_approval(req: Dictionary, allow: bool) -> void:
+	if tools != null:
+		tools.resolve_approval(String(req["ticket"]), allow)
+	var line := ("🔓 allowed: " if allow else "⛔ denied: ") + String(req["tool"]) + "  " + String(req["summary"]).left(80)
+	_add_meta(line)
+	if not _chat.is_empty():
+		_record({"role": "meta", "text": line})
+	if _approval_dialog != null and is_instance_valid(_approval_dialog):
+		_approval_dialog.queue_free()
+	_approval_dialog = null
+	_show_next_approval()
 
 
 # ------------------------------------------------------------------ backend

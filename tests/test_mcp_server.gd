@@ -15,6 +15,7 @@ func _initialize() -> void:
 	tools.editor_enabled = false
 	var server := McpServer.new()
 	server.tools = tools
+	tools.server = server
 	if server.start(9210) != OK:
 		push_error("could not bind test port")
 		quit(1)
@@ -32,8 +33,9 @@ func _initialize() -> void:
 	# tools/list
 	resp = _rpc(server, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
 	var tool_list: Array = resp.get("result", {}).get("tools", [])
-	_check("tools/list returns echo", tool_list.size() == 1 and tool_list[0].get("name", "") == "echo")
-	_check("echo has object schema", tool_list[0].get("inputSchema", {}).get("type", "") == "object")
+	var names: Array = tool_list.map(func(t): return t.get("name", ""))
+	_check("tools/list returns echo + approve", tool_list.size() == 2 and names.has("echo") and names.has("approve"))
+	_check("tools have object schemas", tool_list.all(func(t): return t.get("inputSchema", {}).get("type", "") == "object"))
 
 	# tools/call
 	resp = _rpc(server, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "hello godot"}}})
@@ -49,9 +51,54 @@ func _initialize() -> void:
 	resp = _rpc(server, {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "missing", "arguments": {}}})
 	_check("unknown tool flagged isError", resp.get("result", {}).get("isError", false) == true)
 
+	# async approve: the response must be parked until resolve_approval
+	var peer := StreamPeerTCP.new()
+	peer.connect_to_host("127.0.0.1", server.port)
+	var abody := JSON.stringify({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+		"params": {"name": "approve", "arguments": {"tool_name": "Bash", "input": {"command": "ls -la"}}}}).to_utf8_buffer()
+	var ahead := "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % abody.size()
+	var sent := false
+	var response := PackedByteArray()
+	for i in range(150):
+		server.poll()
+		peer.poll()
+		if peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
+			if not sent:
+				peer.put_data(ahead.to_utf8_buffer())
+				peer.put_data(abody)
+				sent = true
+			elif peer.get_available_bytes() > 0:
+				var r := peer.get_data(peer.get_available_bytes())
+				if r[0] == OK:
+					response.append_array(r[1])
+		OS.delay_msec(2)
+	_check("approve parks the request (no early response)", response.is_empty() and tools.pending_approvals.size() == 1)
+	var ticket := String(tools.pending_approvals.keys()[0]) if tools.pending_approvals.size() > 0 else ""
+	tools.resolve_approval(ticket, true)
+	for i in range(500):
+		server.poll()
+		peer.poll()
+		var st := peer.get_status()
+		if st == StreamPeerTCP.STATUS_CONNECTED and peer.get_available_bytes() > 0:
+			var r := peer.get_data(peer.get_available_bytes())
+			if r[0] == OK:
+				response.append_array(r[1])
+		if st == StreamPeerTCP.STATUS_NONE or st == StreamPeerTCP.STATUS_ERROR:
+			break
+		OS.delay_msec(2)
+	var araw := response.get_string_from_utf8()
+	var body_at := araw.find("\r\n\r\n")
+	var envelope = JSON.parse_string(araw.substr(body_at + 4)) if body_at >= 0 else null
+	var inner = null
+	if envelope is Dictionary:
+		inner = JSON.parse_string(String(envelope.get("result", {}).get("content", [{}])[0].get("text", "")))
+	_check("approve resolves to allow with original input",
+		inner is Dictionary and inner.get("behavior", "") == "allow" and inner.get("updatedInput", {}).get("command", "") == "ls -la")
+	peer.disconnect_from_host()
+
 	server.stop()
 	if _failures == 0:
-		print("PASS: test_mcp_server (8 checks)")
+		print("PASS: test_mcp_server (10 checks)")
 	quit(_failures)
 
 
