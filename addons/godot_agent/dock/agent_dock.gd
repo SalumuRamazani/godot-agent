@@ -5,6 +5,7 @@ extends VBoxContainer
 ## state; agent output reads like a document, tools render as compact pills.
 
 const EditorContextBuilder := preload("../context/editor_context.gd")
+const ChatStore := preload("chat_store.gd")
 
 const CLAUDE_MODELS := ["sonnet", "opus", "haiku"]
 const SETTINGS_PATH := "user://godot_agent.cfg"
@@ -64,6 +65,12 @@ var _last_pill := {}    # most recent entry, for coalescing identical calls
 var _think_header: Button
 var _think_body: RichTextLabel
 var _think_raw := ""
+var _history_btn: MenuButton
+var _history_ids: Array[String] = []
+var _chat := {}            # current persisted conversation (chat_store.gd)
+var _rec_by_call := {}     # call_id -> index into _chat.messages
+var _restoring := false
+var _last_final_text := ""
 
 var _re_bold: RegEx
 var _re_inline_code: RegEx
@@ -85,7 +92,7 @@ func _ready() -> void:
 	_build_ui()
 	_apply_settings()
 	_select_backend(_backend_sel.selected)
-	_welcome()
+	_restore_latest()
 
 
 # ------------------------------------------------------------------ theme bits
@@ -134,6 +141,13 @@ func _build_ui() -> void:
 	var spacer := Control.new()
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	title_row.add_child(spacer)
+	_history_btn = MenuButton.new()
+	_history_btn.text = "History"
+	_history_btn.flat = true
+	_history_btn.tooltip_text = "Reopen a previous conversation (it continues the same agent session)"
+	_history_btn.about_to_popup.connect(_fill_history)
+	_history_btn.get_popup().id_pressed.connect(_on_history_pick)
+	title_row.add_child(_history_btn)
 	_new_btn = Button.new()
 	_new_btn.text = "＋ New"
 	_new_btn.flat = true
@@ -520,6 +534,134 @@ func _welcome() -> void:
 		_add_error(String(avail["detail"]))
 
 
+# ------------------------------------------------------------------ history
+
+func _record(entry: Dictionary) -> int:
+	if _restoring:
+		return -1
+	if _chat.is_empty():
+		var model: String = CLAUDE_MODELS[_claude_model_sel.selected] if _backend_id == "claude_code" else _model_btn.text
+		_chat = ChatStore.create(_backend_id, model)
+	if String(entry.get("role", "")) == "user" and String(_chat.get("title", "")) == "":
+		_chat["title"] = String(entry.get("text", "")).left(48).replace("\n", " ")
+	_chat["messages"].append(entry)
+	ChatStore.save(_chat)
+	return _chat["messages"].size() - 1
+
+
+func _rel_date(ts: int) -> String:
+	var diff := int(Time.get_unix_time_from_system()) - ts
+	if diff < 90:
+		return "just now"
+	if diff < 3600:
+		return "%dm ago" % (diff / 60)
+	if diff < 86400:
+		return "%dh ago" % (diff / 3600)
+	return "%dd ago" % (diff / 86400)
+
+
+func _fill_history() -> void:
+	var popup := _history_btn.get_popup()
+	popup.clear()
+	_history_ids.clear()
+	for c in ChatStore.list_chats():
+		if String(c["id"]) == String(_chat.get("id", "")):
+			continue
+		var title := String(c["title"])
+		if title == "":
+			title = "(untitled)"
+		popup.add_item("%s   ·  %s" % [title.left(38), _rel_date(int(c["updated"]))])
+		_history_ids.append(String(c["id"]))
+	if _history_ids.is_empty():
+		popup.add_item("no previous conversations")
+		popup.set_item_disabled(0, true)
+
+
+func _on_history_pick(id: int) -> void:
+	var idx := _history_btn.get_popup().get_item_index(id)
+	if idx >= 0 and idx < _history_ids.size():
+		_load_chat(_history_ids[idx])
+
+
+func _restore_latest() -> void:
+	var chats := ChatStore.list_chats()
+	if chats.is_empty():
+		_welcome()
+		return
+	_load_chat(String(chats[0]["id"]))
+
+
+func _load_chat(id: String) -> void:
+	var chat := ChatStore.load_chat(id)
+	if chat.is_empty():
+		_welcome()
+		return
+	if _busy:
+		_backend.cancel()
+		_set_busy(false)
+	for c in _messages.get_children():
+		c.queue_free()
+	_cur_label = null
+	_cur_raw = ""
+	_last_final_text = ""
+	_collapse_thinking()
+	_reset_pills()
+	_pills.clear()
+	_rec_by_call.clear()
+	_chat = chat
+	# Switch UI to the chat's backend/model before rendering.
+	var target := String(chat.get("backend", _backend_id))
+	if backend_ids.has(target) and target != _backend_id:
+		_backend_sel.selected = backend_ids.find(target)
+		_select_backend(_backend_sel.selected)
+	var model := String(chat.get("model", ""))
+	if model != "":
+		if _backend_id == "claude_code" and CLAUDE_MODELS.has(model):
+			_claude_model_sel.selected = CLAUDE_MODELS.find(model)
+		elif _backend_id != "claude_code" and model.contains("/"):
+			_model_btn.text = model
+		_apply_backend_options()
+	_restoring = true
+	var i := 0
+	for m in chat.get("messages", []):
+		if not (m is Dictionary):
+			continue
+		match String(m.get("role", "")):
+			"user":
+				_add_user_bubble(str(m.get("text", "")))
+			"assistant":
+				_begin_assistant_bubble()
+				_cur_raw = str(m.get("text", ""))
+				_cur_label.text = _md_to_bbcode(_cur_raw)
+				_cur_label = null
+				_cur_raw = ""
+			"thinking":
+				_begin_thinking_block()
+				_think_raw = str(m.get("text", ""))
+				_think_body.text = _think_raw
+				_collapse_thinking()
+			"tool":
+				var hid := "hist_%d" % i
+				_on_backend_tool_activity(hid, str(m.get("name", "tool")), "")
+				if str(m.get("detail", "")) != "" or str(m.get("body", "")) != "":
+					_on_backend_tool_update(hid, str(m.get("name", "tool")), str(m.get("detail", "")), str(m.get("body", "")))
+			"meta":
+				_add_meta(str(m.get("text", "")))
+			"error":
+				_add_error(str(m.get("text", "")))
+		i += 1
+	_restoring = false
+	_reset_pills()
+	_pills.clear()
+	var sid := String(chat.get("session_id", ""))
+	if sid != "":
+		_backend.session_id = sid
+		if "first_turn" in _backend:
+			_backend.first_turn = false
+	_add_meta("↺ restored (%s)%s" % [_rel_date(int(chat.get("updated", 0))), " · same agent session continues" if sid != "" else ""])
+	_queue_scroll()
+
+
 # ------------------------------------------------------------------ backend
 
 func _select_backend(idx: int) -> void:
@@ -597,6 +739,8 @@ func _on_send() -> void:
 		return
 	_input.text = ""
 	_add_user_bubble(text)
+	_record({"role": "user", "text": text})
+	_last_final_text = ""
 	var prompt := EditorContextBuilder.build(tools) + "\n\nUser request:\n" + text
 	_set_busy(true)
 	_backend.send(prompt)
@@ -619,9 +763,12 @@ func _on_new_chat() -> void:
 		c.queue_free()
 	_cur_label = null
 	_cur_raw = ""
+	_last_final_text = ""
 	_collapse_thinking()
 	_reset_pills()
 	_pills.clear()
+	_rec_by_call.clear()
+	_chat = {}
 	_welcome()
 
 
@@ -690,6 +837,8 @@ func _collapse_thinking() -> void:
 		_think_body.visible = false
 		if _think_header != null and is_instance_valid(_think_header):
 			_think_header.text = "✦ Thought ▸"
+	if _think_raw.strip_edges() != "":
+		_record({"role": "thinking", "text": _think_raw})
 	_think_body = null
 	_think_header = null
 	_think_raw = ""
@@ -708,6 +857,8 @@ func _on_backend_stream_delta(text: String) -> void:
 func _on_backend_message_complete(full_text: String) -> void:
 	_collapse_thinking()
 	_reset_pills()
+	if _cur_label == null and full_text.strip_edges() == _last_final_text.strip_edges():
+		return  # this text already streamed and was finalized at a tool boundary
 	if _cur_label == null:
 		_begin_assistant_bubble()
 	_cur_raw = full_text
@@ -758,6 +909,9 @@ func _on_backend_tool_activity(call_id: String, tool_name: String, _detail: Stri
 		"count": 1, "plain": true, "body": "", "expand": null}
 	if call_id != "":
 		_pills[call_id] = entry
+		var rec_idx := _record({"role": "tool", "name": short_name, "detail": "", "body": ""})
+		if rec_idx >= 0:
+			_rec_by_call[call_id] = rec_idx
 	_last_pill = entry
 	_queue_scroll()
 
@@ -787,6 +941,14 @@ func _on_backend_tool_update(call_id: String, tool_name: String, detail: String,
 		pill.gui_input.connect(func(ev: InputEvent):
 			if ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_LEFT:
 				_toggle_diff(entry))
+	if not _restoring and _rec_by_call.has(call_id):
+		var rec_idx: int = _rec_by_call[call_id]
+		if rec_idx < _chat.get("messages", []).size():
+			if detail != "":
+				_chat["messages"][rec_idx]["detail"] = detail
+			if body != "":
+				_chat["messages"][rec_idx]["body"] = body
+			ChatStore.save(_chat)
 	_queue_scroll()
 
 
@@ -850,6 +1012,12 @@ func _on_backend_turn_done(meta: Dictionary) -> void:
 	if int(meta.get("duration_ms", 0)) > 0:
 		bits.append("%.1fs" % (int(meta["duration_ms"]) / 1000.0))
 	_add_meta("✓ done" + ("   " + "  ·  ".join(bits) if not bits.is_empty() else ""))
+	if not _chat.is_empty():
+		_record({"role": "meta", "text": "✓ done" + ("   " + "  ·  ".join(bits) if not bits.is_empty() else "")})
+		_chat["session_id"] = String(_backend.session_id) if "session_id" in _backend else ""
+		_chat["backend"] = _backend_id
+		_chat["model"] = CLAUDE_MODELS[_claude_model_sel.selected] if _backend_id == "claude_code" else _model_btn.text
+		ChatStore.save(_chat)
 	_set_busy(false)
 	if tools != null and tools.editor_enabled:
 		tools.call_tool("refresh_filesystem", {})
@@ -861,6 +1029,8 @@ func _on_backend_error(message: String) -> void:
 	_collapse_thinking()
 	_reset_pills()
 	_add_error(message)
+	if not _chat.is_empty():
+		_record({"role": "error", "text": message})
 	_set_busy(false)
 	_queue_scroll()
 
@@ -926,6 +1096,9 @@ func _begin_assistant_bubble() -> void:
 
 
 func _finalize_stream() -> void:
+	if _cur_label != null and _cur_raw.strip_edges() != "":
+		_last_final_text = _cur_raw
+		_record({"role": "assistant", "text": _cur_raw})
 	if _cur_label != null and _cur_raw.strip_edges() == "":
 		var panel := _cur_label.get_parent()
 		if panel != null:
