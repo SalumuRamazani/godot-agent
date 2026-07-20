@@ -18,7 +18,10 @@ config/name="Godot Agent Demo"
 config/features=PackedStringArray("4.7")
 config/icon="res://icon.svg"
 
+[autoload]
+
+GodotAgentProbe="*uid://dwoi2wgkhxxek"
+
 [editor_plugins]
 
 enabled=PackedStringArray("res://addons/godot_agent/plugin.cfg")
-

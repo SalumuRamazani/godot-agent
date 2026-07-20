@@ -10,10 +10,14 @@ const McpTools := preload("mcp/tools.gd")
 const ClaudeBackend := preload("backends/claude_code.gd")
 const OpencodeBackend := preload("backends/opencode.gd")
 const AgentDock := preload("dock/agent_dock.gd")
+const Checkpoints := preload("util/checkpoints.gd")
+
+const PROBE_AUTOLOAD := "GodotAgentProbe"
 
 var server
 var tools
 var dock
+var checkpoints
 var backends := {}
 
 
@@ -35,9 +39,15 @@ func _enter_tree() -> void:
 	opencode.mcp_url = "http://127.0.0.1:%d/mcp" % server.port
 	backends = {"claude_code": claude, "opencode": opencode}
 
+	checkpoints = Checkpoints.new()
+	checkpoints.available = checkpoints.setup()
+	if not ProjectSettings.has_setting("autoload/" + PROBE_AUTOLOAD):
+		add_autoload_singleton(PROBE_AUTOLOAD, "res://addons/godot_agent/runtime/frame_probe.gd")
+
 	dock = AgentDock.new()
 	dock.name = "Agent"
 	dock.setup(backends, ["claude_code", "opencode"], tools, server.port)
+	dock.checkpoints = checkpoints
 	# Bottom-right slot: usually empty, so the dock gets its own always-visible
 	# panel under the Inspector instead of an overflowing tab strip.
 	add_control_to_dock(EditorPlugin.DOCK_SLOT_RIGHT_BL, dock)

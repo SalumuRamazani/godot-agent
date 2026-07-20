@@ -89,6 +89,9 @@ func list_tools() -> Array:
 			{"setting": {"type": "string"}}, ["setting"]),
 		_def("get_node_properties", "Current non-default property values of a node in the edited scene (what the Inspector shows changed).",
 			{"node_path": {"type": "string"}}, ["node_path"]),
+		_def("get_game_screenshot", "SEE the running game: returns the latest screenshot (refreshed every second) of the game started with run_project. Wait ~2s after starting before the first call. Use it to verify visuals, layout and that things actually appear.", {}, []),
+		_def("screenshot_editor", "SEE the editor viewport (the scene as the user sees it while editing). view: '2d' or '3d' (default 3d).",
+			{"view": {"type": "string"}}, []),
 	]
 
 
@@ -164,6 +167,10 @@ func call_tool(tool_name: String, args: Dictionary) -> Dictionary:
 			return _ok(var_to_str(ProjectSettings.get_setting(s)))
 		"get_node_properties":
 			return _get_node_properties(args)
+		"get_game_screenshot":
+			return _get_game_screenshot()
+		"screenshot_editor":
+			return _screenshot_editor(args)
 		_:
 			return _err("unknown tool: " + tool_name)
 
@@ -557,6 +564,7 @@ func _run_project(args: Dictionary) -> Dictionary:
 	var scene := String(args.get("scene", ""))
 	if scene != "":
 		run_args.append(scene)
+	run_args.append_array(PackedStringArray(["--", "--ga-frames=" + _frames_dir()]))
 	var err: int = run_proc.start(OS.get_executable_path(), run_args)
 	if err != OK:
 		return _err("failed to start the game process (%d)" % err)
@@ -706,6 +714,43 @@ func _get_node_properties(args: Dictionary) -> Dictionary:
 	if node.get_script() != null:
 		lines.append("  script = " + str(node.get_script().resource_path))
 	return _ok("\n".join(lines))
+
+
+func _frames_dir() -> String:
+	return ProjectSettings.globalize_path("user://godot_agent_frames")
+
+
+func _get_game_screenshot() -> Dictionary:
+	var path := _frames_dir().path_join("frame_latest.png")
+	if not FileAccess.file_exists(path):
+		if run_proc == null or not run_proc.running:
+			return _err("no game running — start it with run_project first, wait ~2s, then call again")
+		return _err("no frame captured yet — wait a second and call again")
+	var age := int(Time.get_unix_time_from_system()) - int(FileAccess.get_modified_time(path))
+	var bytes := FileAccess.get_file_as_bytes(path)
+	if bytes.is_empty():
+		return _err("frame file unreadable")
+	var note := "Screenshot of the running game (saved at %s)." % path
+	if age > 5:
+		note += " WARNING: frame is %ds old — the game may have stopped or crashed; check get_run_output." % age
+	return {"text": note, "is_error": false, "image_b64": Marshalls.raw_to_base64(bytes)}
+
+
+func _screenshot_editor(args: Dictionary) -> Dictionary:
+	var view := String(args.get("view", "3d"))
+	var vp: Viewport = EditorInterface.get_editor_viewport_2d() if view == "2d" else EditorInterface.get_editor_viewport_3d(0)
+	if vp == null:
+		return _err("no %s editor viewport" % view)
+	var img := vp.get_texture().get_image()
+	if img == null or img.is_empty():
+		return _err("could not capture the editor viewport (headless editor has no rendering)")
+	if img.get_width() > 1152:
+		img.resize(1152, int(img.get_height() * 1152.0 / img.get_width()))
+	DirAccess.make_dir_recursive_absolute(_frames_dir())
+	var path := _frames_dir().path_join("editor_%s.png" % view)
+	img.save_png(path)
+	return {"text": "Editor %s viewport screenshot (saved at %s)." % [view, path], "is_error": false,
+		"image_b64": Marshalls.raw_to_base64(FileAccess.get_file_as_bytes(path))}
 
 
 func _play_in_editor(args: Dictionary) -> Dictionary:

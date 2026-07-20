@@ -19,6 +19,8 @@ var tools
 var backends := {}
 var backend_ids: Array = []
 var mcp_port := 0
+var checkpoints  # util/checkpoints.gd, set by the plugin
+var _turn_checkpoint := ""
 
 var _backend
 var _backend_id := "claude_code"
@@ -741,6 +743,10 @@ func _on_send() -> void:
 	_add_user_bubble(text)
 	_record({"role": "user", "text": text})
 	_last_final_text = ""
+	_turn_checkpoint = ""
+	if checkpoints != null and checkpoints.available and not _mode_plan.button_pressed \
+			and bool(_cfg.get_value("checkpoints", "enabled", true)):
+		_turn_checkpoint = checkpoints.checkpoint()
 	var prompt := EditorContextBuilder.build(tools) + "\n\nUser request:\n" + text
 	_set_busy(true)
 	_backend.send(prompt)
@@ -1011,9 +1017,10 @@ func _on_backend_turn_done(meta: Dictionary) -> void:
 		bits.append("%d steps" % int(meta["num_turns"]))
 	if int(meta.get("duration_ms", 0)) > 0:
 		bits.append("%.1fs" % (int(meta["duration_ms"]) / 1000.0))
-	_add_meta("✓ done" + ("   " + "  ·  ".join(bits) if not bits.is_empty() else ""))
+	var done_text := "✓ done" + ("   " + "  ·  ".join(bits) if not bits.is_empty() else "")
+	_add_done_row(done_text, _turn_checkpoint)
 	if not _chat.is_empty():
-		_record({"role": "meta", "text": "✓ done" + ("   " + "  ·  ".join(bits) if not bits.is_empty() else "")})
+		_record({"role": "meta", "text": done_text})
 		_chat["session_id"] = String(_backend.session_id) if "session_id" in _backend else ""
 		_chat["backend"] = _backend_id
 		_chat["model"] = CLAUDE_MODELS[_claude_model_sel.selected] if _backend_id == "claude_code" else _model_btn.text
@@ -1135,6 +1142,44 @@ func _add_meta(text: String) -> void:
 	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_messages.add_child(label)
 	_queue_scroll()
+
+
+func _add_done_row(text: String, cp: String) -> void:
+	var row := HBoxContainer.new()
+	var label := _caption(text, 10)
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(label)
+	if cp != "" and checkpoints != null:
+		var btn := Button.new()
+		btn.text = "↩ revert"
+		btn.flat = true
+		btn.add_theme_font_size_override("font_size", 10)
+		btn.modulate = Color(1, 1, 1, 0.55)
+		btn.tooltip_text = "Restore every project file to how it was before this turn.\nFiles the turn created are deleted; the editor cache (.godot) is untouched."
+		btn.pressed.connect(func(): _confirm_revert(cp, btn))
+		row.add_child(btn)
+	_messages.add_child(row)
+	_queue_scroll()
+
+
+func _confirm_revert(cp: String, btn: Button) -> void:
+	var d := ConfirmationDialog.new()
+	d.dialog_text = "Revert all project files to before this turn?\nFiles created during the turn will be deleted."
+	d.ok_button_text = "Revert"
+	add_child(d)
+	d.confirmed.connect(func():
+		var err: String = checkpoints.restore(cp)
+		if err != "":
+			_add_error("revert failed: " + err)
+		else:
+			if tools != null and tools.editor_enabled:
+				EditorInterface.get_resource_filesystem().scan()
+			_add_meta("↩ reverted to the pre-turn checkpoint · reopen scenes if the editor asks")
+			_record({"role": "meta", "text": "↩ reverted to the pre-turn checkpoint"})
+			btn.disabled = true
+		d.queue_free())
+	d.canceled.connect(func(): d.queue_free())
+	d.popup_centered()
 
 
 func _queue_scroll() -> void:

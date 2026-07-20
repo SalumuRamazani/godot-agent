@@ -163,8 +163,12 @@ func _dispatch(msg: Dictionary) -> Dictionary:
 			if not (args is Dictionary):
 				args = {}
 			var out: Dictionary = tools.call_tool(tool_name, args)
+			var content := []
+			if String(out.get("image_b64", "")) != "":
+				content.append({"type": "image", "data": String(out["image_b64"]), "mimeType": "image/png"})
+			content.append({"type": "text", "text": String(out.get("text", ""))})
 			return _result(id, {
-				"content": [{"type": "text", "text": String(out.get("text", ""))}],
+				"content": content,
 				"isError": bool(out.get("is_error", false)),
 			})
 		_:
